@@ -1,0 +1,1174 @@
+
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const json = (data: unknown, status = 200) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+
+const env = (name: string) => {
+  const value = Deno.env.get(name);
+  if (!value) throw new Error(`Missing environment variable: ${name}`);
+  return value;
+};
+
+const db = () =>
+  createClient(
+    env("SUPABASE_URL"),
+    env("SUPABASE_SERVICE_ROLE_KEY"),
+    { auth: { persistSession: false, autoRefreshToken: false } },
+  );
+
+async function sha256(value: string): Promise<string> {
+  const hash = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function requiredText(value: unknown, max = 2000): string | null {
+  if (typeof value !== "string") return null;
+  const result = value.trim();
+  return result.length > 0 && result.length <= max ? result : null;
+}
+
+async function authenticate(request: Request, supabase: ReturnType<typeof db>) {
+  const header = request.headers.get("Authorization") || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token || token.length > 512) return null;
+
+  const tokenHash = await sha256(token);
+  const { data: session, error } = await supabase
+    .from("stax_sessions")
+    .select("account_id")
+    .eq("token_hash", tokenHash)
+    .gt("expires_at", new Date().toISOString())
+    .maybeSingle();
+
+  if (error || !session) return null;
+
+  const { data: account, error: accountError } = await supabase
+    .from("stax_accounts")
+    .select("id,user_id,display_name,is_private,is_banned,is_admin")
+    .eq("id", session.account_id)
+    .maybeSingle();
+
+  if (accountError || !account || account.is_banned) return null;
+  return { account, tokenHash };
+}
+
+async function blockedEitherWay(
+  supabase: ReturnType<typeof db>,
+  a: string,
+  b: string,
+) {
+  const { data, error } = await supabase
+    .from("stax_blocks")
+    .select("blocker_id")
+    .or(`and(blocker_id.eq.${a},blocked_id.eq.${b}),and(blocker_id.eq.${b},blocked_id.eq.${a})`)
+    .limit(1);
+
+  if (error) throw error;
+  return Boolean(data?.length);
+}
+
+async function notify(
+  supabase: ReturnType<typeof db>,
+  recipientId: string,
+  actorId: string,
+  type: string,
+  postId?: string,
+) {
+  if (recipientId === actorId) return;
+
+  const { error } = await supabase.from("stax_notifications").insert({
+    recipient_id: recipientId,
+    actor_id: actorId,
+    notification_type: type,
+    post_id: postId ?? null,
+  });
+
+  if (error) throw error;
+}
+
+async function isFollowing(
+  supabase: ReturnType<typeof db>,
+  followerId: string,
+  followingId: string,
+) {
+  const { data, error } = await supabase
+    .from("stax_follows")
+    .select("follower_id")
+    .eq("follower_id", followerId)
+    .eq("following_id", followingId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return Boolean(data);
+}
+
+async function isConversationMember(
+  supabase: ReturnType<typeof db>,
+  conversationId: string,
+  accountId: string,
+) {
+  const { data, error } = await supabase
+    .from("stax_conversation_members")
+    .select("account_id")
+    .eq("conversation_id", conversationId)
+    .eq("account_id", accountId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return Boolean(data);
+}
+
+Deno.serve(async (request: Request) => {
+  if (request.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+
+  try {
+    const body = await request.json();
+    const action = body?.action;
+    if (typeof action !== "string") {
+      return json({ error: "action is required" }, 400);
+    }
+
+    const supabase = db();
+    const auth = await authenticate(request, supabase);
+    if (!auth) return json({ error: "ログインしてください。" }, 401);
+
+    const me = auth.account;
+    const myId = me.id;
+
+    // Current account
+    if (action === "me") return json({ user: me });
+
+    // Update own profile
+    if (action === "update_profile") {
+      const displayName = requiredText(body.display_name, 40);
+      if (!displayName) {
+        return json({ error: "表示名は1〜40文字で入力してください。" }, 400);
+      }
+
+      const bio = typeof body.bio === "string" ? body.bio.trim().slice(0, 300) : "";
+      const website = typeof body.website === "string" ? body.website.trim().slice(0, 2048) : "";
+      const avatarUrl = typeof body.avatar_url === "string" ? body.avatar_url.trim().slice(0, 2048) : "";
+
+      for (const [label, value] of [["ウェブサイト", website], ["プロフィール画像URL", avatarUrl]] as const) {
+        if (value) {
+          try {
+            const parsed = new URL(value);
+            if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("bad protocol");
+          } catch {
+            return json({ error: `${label}にはhttpまたはhttpsのURLを指定してください。` }, 400);
+          }
+        }
+      }
+
+      const { data: user, error } = await supabase
+        .from("stax_accounts")
+        .update({
+          display_name: displayName,
+          bio,
+          website: website || null,
+          avatar_url: avatarUrl || null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", myId)
+        .select("id,user_id,display_name,bio,website,avatar_url,is_private,is_banned,is_admin,updated_at")
+        .single();
+
+      if (error) throw error;
+      return json({ user });
+    }
+
+    // Own profile and posts
+    if (action === "profile") {
+      const { data: user, error: userError } = await supabase
+        .from("stax_accounts")
+        .select("id,user_id,display_name,bio,website,avatar_url,is_private,created_at")
+        .eq("id", myId)
+        .single();
+      if (userError) throw userError;
+
+      const { data: posts, error: postsError } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
+        .eq("author_id", myId)
+        .eq("is_deleted", false)
+        .order("is_pinned", { ascending: false })
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (postsError) throw postsError;
+
+      const resultPosts = [];
+      for (const post of posts || []) {
+        const { count: likes, error: likesError } = await supabase
+          .from("stax_likes")
+          .select("post_id", { count: "exact", head: true })
+          .eq("post_id", post.id);
+        if (likesError) throw likesError;
+
+        const { data: liked, error: likedError } = await supabase
+          .from("stax_likes")
+          .select("post_id")
+          .eq("post_id", post.id)
+          .eq("account_id", myId)
+          .maybeSingle();
+        if (likedError) throw likedError;
+
+        const { data: repost, error: repostError } = await supabase
+          .from("stax_posts")
+          .select("id")
+          .eq("author_id", myId)
+          .eq("repost_of_id", post.id)
+          .eq("is_deleted", false)
+          .maybeSingle();
+        if (repostError) throw repostError;
+
+        resultPosts.push({
+          ...post,
+          user_id: user.user_id,
+          display_name: user.display_name,
+          avatar_url: user.avatar_url,
+          like_count: likes || 0,
+          liked_by_me: Boolean(liked),
+          reposted_by_me: Boolean(repost),
+        });
+      }
+      return json({ user, posts: resultPosts });
+    }
+
+    // Delete own post or reply (soft-delete)
+    if (action === "delete_post") {
+      const postId = body.post_id;
+      if (typeof postId !== "string") return json({ error: "post_id is required" }, 400);
+
+      const { data: post, error: postError } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,is_deleted")
+        .eq("id", postId)
+        .maybeSingle();
+      if (postError) throw postError;
+      if (!post || post.is_deleted) return json({ error: "投稿が見つかりません。" }, 404);
+      if (post.author_id !== myId) return json({ error: "自分の投稿だけ削除できます。" }, 403);
+
+      const { error } = await supabase
+        .from("stax_posts")
+        .update({ is_deleted: true, updated_at: new Date().toISOString() })
+        .eq("id", postId)
+        .eq("author_id", myId);
+      if (error) throw error;
+      return json({ success: true, deleted: true });
+    }
+
+    // Pin/unpin one of own posts
+    if (action === "pin_post") {
+      const postId = body.post_id;
+      const pinned = body.pinned === true;
+      if (typeof postId !== "string") return json({ error: "post_id is required" }, 400);
+
+      const { data: post, error: postError } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,is_deleted")
+        .eq("id", postId)
+        .maybeSingle();
+      if (postError) throw postError;
+      if (!post || post.is_deleted) return json({ error: "投稿が見つかりません。" }, 404);
+      if (post.author_id !== myId) return json({ error: "自分の投稿だけピン留めできます。" }, 403);
+
+      if (pinned) {
+        const { error: unpinError } = await supabase
+          .from("stax_posts")
+          .update({ is_pinned: false })
+          .eq("author_id", myId)
+          .eq("is_pinned", true);
+        if (unpinError) throw unpinError;
+      }
+
+      const { error } = await supabase
+        .from("stax_posts")
+        .update({ is_pinned: pinned, updated_at: new Date().toISOString() })
+        .eq("id", postId)
+        .eq("author_id", myId);
+      if (error) throw error;
+      return json({ success: true, pinned });
+    }
+
+    // Create post / reply / quote
+    if (action === "create_post" || action === "reply") {
+      const content = requiredText(body.text, 2000);
+      if (!content) return json({ error: "投稿内容を入力してください。" }, 400);
+
+      const replyTo = action === "reply" ? body.post_id : body.reply_to_id;
+      const quoteId = body.quote_post_id;
+
+      if (replyTo || quoteId) {
+        const targetId = replyTo || quoteId;
+        const { data: target, error: targetError } = await supabase
+          .from("stax_posts")
+          .select("id,author_id,visibility,is_deleted")
+          .eq("id", targetId)
+          .eq("is_deleted", false)
+          .maybeSingle();
+
+        if (targetError) throw targetError;
+        if (!target) return json({ error: "対象の投稿がありません。" }, 404);
+        if (await blockedEitherWay(supabase, myId, target.author_id)) {
+          return json({ error: "この投稿には操作できません。" }, 403);
+        }
+        if (target.visibility !== "public" &&
+            target.author_id !== myId &&
+            !(await isFollowing(supabase, myId, target.author_id))) {
+          return json({ error: "この投稿は閲覧できません。" }, 403);
+        }
+      }
+
+      const { data: post, error } = await supabase
+        .from("stax_posts")
+        .insert({
+          author_id: myId,
+          content,
+          reply_to_id: replyTo || null,
+          quote_post_id: quoteId || null,
+          visibility: "public",
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+
+      // Extract and attach hashtags.
+      const tags = [...new Set(
+        [...content.matchAll(/#([\p{L}\p{N}_]{1,50})/gu)]
+          .map((match) => match[1].toLowerCase())
+      )].slice(0, 20);
+
+      for (const tag of tags) {
+        const { data: hashtag, error: tagError } = await supabase
+          .from("stax_hashtags")
+          .upsert({ tag }, { onConflict: "tag" })
+          .select("id")
+          .single();
+
+        if (tagError) throw tagError;
+
+        const { error: linkError } = await supabase
+          .from("stax_post_hashtags")
+          .upsert(
+            { post_id: post.id, hashtag_id: hashtag.id },
+            { onConflict: "post_id,hashtag_id" },
+          );
+
+        if (linkError) throw linkError;
+      }
+
+      if (replyTo || quoteId) {
+        const targetId = replyTo || quoteId;
+        const { data: target } = await supabase
+          .from("stax_posts")
+          .select("author_id")
+          .eq("id", targetId)
+          .maybeSingle();
+
+        if (target) {
+          await notify(
+            supabase,
+            target.author_id,
+            myId,
+            replyTo ? "reply" : "mention",
+            post.id,
+          );
+        }
+      }
+
+      return json({ post }, 201);
+    }
+
+    // Timeline
+    if (action === "timeline") {
+      const { data: follows, error: followError } = await supabase
+        .from("stax_follows")
+        .select("following_id")
+        .eq("follower_id", myId);
+
+      if (followError) throw followError;
+
+      const authorIds = [
+        myId,
+        ...(follows || []).map((row) => row.following_id),
+      ];
+
+      const { data: posts, error } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
+        .eq("is_deleted", false)
+        .in("author_id", authorIds)
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (error) throw error;
+
+      const visible = [];
+      for (const post of posts || []) {
+        if (await blockedEitherWay(supabase, myId, post.author_id)) continue;
+
+        const { data: author } = await supabase
+          .from("stax_accounts")
+          .select("user_id,display_name,avatar_url,is_private")
+          .eq("id", post.author_id)
+          .maybeSingle();
+
+        if (!author) continue;
+        if (author.is_private && post.author_id !== myId &&
+            !(await isFollowing(supabase, myId, post.author_id))) continue;
+        if (post.visibility === "private" && post.author_id !== myId) continue;
+        if (post.visibility === "followers" && post.author_id !== myId &&
+            !(await isFollowing(supabase, myId, post.author_id))) continue;
+
+        const { count: likes } = await supabase
+          .from("stax_likes")
+          .select("*", { count: "exact", head: true })
+          .eq("post_id", post.id);
+
+        const { data: liked } = await supabase
+          .from("stax_likes")
+          .select("post_id")
+          .eq("post_id", post.id)
+          .eq("account_id", myId)
+          .maybeSingle();
+
+        const { data: myRepost, error: repostError } = await supabase
+          .from("stax_posts")
+          .select("id")
+          .eq("author_id", myId)
+          .eq("repost_of_id", post.id)
+          .eq("is_deleted", false)
+          .maybeSingle();
+        if (repostError) throw repostError;
+
+        visible.push({
+          ...post,
+          user_id: author.user_id,
+          display_name: author.display_name,
+          avatar_url: author.avatar_url,
+          like_count: likes || 0,
+          liked_by_me: Boolean(liked),
+          reposted_by_me: Boolean(myRepost),
+        });
+      }
+
+      return json({ posts: visible });
+    }
+
+    // Like / unlike
+    if (action === "like") {
+      const postId = body.post_id;
+      if (typeof postId !== "string") {
+        return json({ error: "post_id is required" }, 400);
+      }
+
+      const { data: post, error: postError } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,visibility,is_deleted")
+        .eq("id", postId)
+        .eq("is_deleted", false)
+        .maybeSingle();
+
+      if (postError) throw postError;
+      if (!post) return json({ error: "投稿がありません。" }, 404);
+      if (await blockedEitherWay(supabase, myId, post.author_id)) {
+        return json({ error: "この投稿には操作できません。" }, 403);
+      }
+
+      const { data: existing, error: existingError } = await supabase
+        .from("stax_likes")
+        .select("post_id")
+        .eq("post_id", postId)
+        .eq("account_id", myId)
+        .maybeSingle();
+
+      if (existingError) throw existingError;
+
+      if (existing) {
+        const { error } = await supabase
+          .from("stax_likes")
+          .delete()
+          .eq("post_id", postId)
+          .eq("account_id", myId);
+        if (error) throw error;
+        return json({ liked: false });
+      }
+
+      const { error } = await supabase.from("stax_likes").insert({
+        post_id: postId,
+        account_id: myId,
+      });
+      if (error) throw error;
+
+      await notify(supabase, post.author_id, myId, "like", postId);
+      return json({ liked: true });
+    }
+
+    // Repost / unrepost
+    if (action === "repost") {
+      const postId = body.post_id;
+      if (typeof postId !== "string") {
+        return json({ error: "post_id is required" }, 400);
+      }
+
+      const { data: target, error: targetError } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,is_deleted")
+        .eq("id", postId)
+        .eq("is_deleted", false)
+        .maybeSingle();
+
+      if (targetError) throw targetError;
+      if (!target) return json({ error: "投稿がありません。" }, 404);
+      if (await blockedEitherWay(supabase, myId, target.author_id)) {
+        return json({ error: "この投稿には操作できません。" }, 403);
+      }
+
+      const { data: existing, error: lookupError } = await supabase
+        .from("stax_posts")
+        .select("id")
+        .eq("author_id", myId)
+        .eq("repost_of_id", postId)
+        .eq("is_deleted", false)
+        .maybeSingle();
+
+      if (lookupError) throw lookupError;
+
+      if (existing) {
+        const { error } = await supabase
+          .from("stax_posts")
+          .update({ is_deleted: true })
+          .eq("id", existing.id)
+          .eq("author_id", myId);
+        if (error) throw error;
+        return json({ reposted: false });
+      }
+
+      const { data: repost, error } = await supabase
+        .from("stax_posts")
+        .insert({
+          author_id: myId,
+          content: "",
+          repost_of_id: postId,
+          visibility: "public",
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+      await notify(supabase, target.author_id, myId, "repost", postId);
+      return json({ reposted: true, post: repost }, 201);
+    }
+
+    // Follow / unfollow
+    if (action === "follow") {
+      const targetId = body.account_id;
+      if (typeof targetId !== "string" || targetId === myId) {
+        return json({ error: "account_id is invalid" }, 400);
+      }
+
+      if (await blockedEitherWay(supabase, myId, targetId)) {
+        return json({ error: "このユーザーには操作できません。" }, 403);
+      }
+
+      const { data: target, error: targetError } = await supabase
+        .from("stax_accounts")
+        .select("id,is_private,is_banned")
+        .eq("id", targetId)
+        .maybeSingle();
+
+      if (targetError) throw targetError;
+      if (!target || target.is_banned) {
+        return json({ error: "ユーザーが見つかりません。" }, 404);
+      }
+
+      const following = await isFollowing(supabase, myId, targetId);
+
+      if (following) {
+        const { error } = await supabase
+          .from("stax_follows")
+          .delete()
+          .eq("follower_id", myId)
+          .eq("following_id", targetId);
+        if (error) throw error;
+        return json({ following: false });
+      }
+
+      if (target.is_private) {
+        const { error } = await supabase.from("stax_follow_requests").upsert({
+          requester_id: myId,
+          target_id: targetId,
+          status: "pending",
+        }, { onConflict: "requester_id,target_id" });
+        if (error) throw error;
+        await notify(supabase, targetId, myId, "follow_request");
+        return json({ requested: true });
+      }
+
+      const { error } = await supabase.from("stax_follows").insert({
+        follower_id: myId,
+        following_id: targetId,
+      });
+      if (error) throw error;
+
+      await notify(supabase, targetId, myId, "follow");
+      return json({ following: true });
+    }
+
+    // Search accounts / posts / hashtags
+    if (action === "search") {
+      const query = requiredText(body.query, 100);
+      if (!query) return json({ accounts: [], posts: [], hashtags: [] });
+
+      const safeQuery = query.replace(/[%_\\]/g, "\\$&");
+      const { data: accounts, error: accountError } = await supabase
+        .from("stax_accounts")
+        .select("id,user_id,display_name,avatar_url,bio,is_private")
+        .ilike("user_id", `%${safeQuery}%`)
+        .eq("is_banned", false)
+        .limit(20);
+
+      if (accountError) throw accountError;
+
+      const { data: posts, error: postError } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
+        .eq("is_deleted", false)
+        .ilike("content", `%${safeQuery}%`)
+        .order("created_at", { ascending: false })
+        .limit(30);
+
+      if (postError) throw postError;
+
+      const visiblePosts = [];
+      for (const post of posts || []) {
+        if (await blockedEitherWay(supabase, myId, post.author_id)) continue;
+
+        const { data: author } = await supabase
+          .from("stax_accounts")
+          .select("user_id,display_name,is_private")
+          .eq("id", post.author_id)
+          .maybeSingle();
+
+        if (!author) continue;
+        if (author.is_private && post.author_id !== myId &&
+            !(await isFollowing(supabase, myId, post.author_id))) continue;
+
+        const { count: likeCount, error: likeCountError } = await supabase
+          .from("stax_likes")
+          .select("post_id", { count: "exact", head: true })
+          .eq("post_id", post.id);
+        if (likeCountError) throw likeCountError;
+
+        const { data: liked, error: likedError } = await supabase
+          .from("stax_likes")
+          .select("post_id")
+          .eq("post_id", post.id)
+          .eq("account_id", myId)
+          .maybeSingle();
+        if (likedError) throw likedError;
+
+        const { data: myRepost, error: repostError } = await supabase
+          .from("stax_posts")
+          .select("id")
+          .eq("author_id", myId)
+          .eq("repost_of_id", post.id)
+          .eq("is_deleted", false)
+          .maybeSingle();
+        if (repostError) throw repostError;
+
+        visiblePosts.push({
+          ...post,
+          user_id: author.user_id,
+          display_name: author.display_name,
+          like_count: likeCount || 0,
+          liked_by_me: Boolean(liked),
+          reposted_by_me: Boolean(myRepost),
+        });
+      }
+
+      const tag = query.replace(/^#/, "").toLowerCase();
+      const { data: hashtags, error: tagError } = await supabase
+        .from("stax_hashtags")
+        .select("id,tag")
+        .ilike("tag", `%${safeQuery.replace(/^#/, "")}%`)
+        .limit(20);
+
+      if (tagError) throw tagError;
+
+      return json({
+        accounts: (accounts || []).filter(
+          (a) => a.id === myId || !a.is_private
+        ),
+        posts: visiblePosts,
+        hashtags: hashtags || [],
+      });
+    }
+
+    // Notifications
+    if (action === "notifications") {
+      const { data, error } = await supabase
+        .from("stax_notifications")
+        .select("id,actor_id,notification_type,post_id,is_read,created_at")
+        .eq("recipient_id", myId)
+        .order("created_at", { ascending: false })
+        .limit(100);
+
+      if (error) throw error;
+
+      const notifications = [];
+      for (const item of data || []) {
+        if (item.actor_id && await blockedEitherWay(supabase, myId, item.actor_id)) {
+          continue;
+        }
+        notifications.push(item);
+      }
+
+      return json({ notifications });
+    }
+
+    if (action === "read_notifications") {
+      const { error } = await supabase
+        .from("stax_notifications")
+        .update({ is_read: true })
+        .eq("recipient_id", myId)
+        .eq("is_read", false);
+
+      if (error) throw error;
+      return json({ success: true });
+    }
+
+    // Direct-message conversations list
+    if (action === "messages" || action === "conversations") {
+      const { data: memberships, error: memberError } = await supabase
+        .from("stax_conversation_members")
+        .select("conversation_id,last_read_at,is_muted")
+        .eq("account_id", myId);
+
+      if (memberError) throw memberError;
+
+      const conversations = [];
+      for (const member of memberships || []) {
+        const { data: conversation, error } = await supabase
+          .from("stax_conversations")
+          .select("id,conversation_type,title,owner_id,created_at,updated_at")
+          .eq("id", member.conversation_id)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (!conversation) continue;
+
+        const { data: members } = await supabase
+          .from("stax_conversation_members")
+          .select("account_id")
+          .eq("conversation_id", conversation.id);
+
+        const memberIds = (members || []).map((m) => m.account_id);
+        if (memberIds.some((id) => id !== myId &&
+            blockedEitherWay(supabase, myId, id))) continue;
+
+        conversations.push({
+          ...conversation,
+          last_read_at: member.last_read_at,
+          is_muted: member.is_muted,
+        });
+      }
+
+      return json({ conversations });
+    }
+
+    // Create direct conversation
+    if (action === "create_dm") {
+      const targetId = body.account_id;
+      if (typeof targetId !== "string" || targetId === myId) {
+        return json({ error: "account_id is invalid" }, 400);
+      }
+
+      if (await blockedEitherWay(supabase, myId, targetId)) {
+        return json({ error: "このユーザーにはDMを送れません。" }, 403);
+      }
+
+      const { data: target, error: targetError } = await supabase
+        .from("stax_accounts")
+        .select("id,is_private,is_banned")
+        .eq("id", targetId)
+        .maybeSingle();
+
+      if (targetError) throw targetError;
+      if (!target || target.is_banned) {
+        return json({ error: "ユーザーが見つかりません。" }, 404);
+      }
+
+      const { data: existingMemberships, error: membershipError } =
+        await supabase
+          .from("stax_conversation_members")
+          .select("conversation_id")
+          .eq("account_id", myId);
+
+      if (membershipError) throw membershipError;
+
+      for (const member of existingMemberships || []) {
+        const { data: conversation } = await supabase
+          .from("stax_conversations")
+          .select("id,conversation_type")
+          .eq("id", member.conversation_id)
+          .eq("conversation_type", "direct")
+          .maybeSingle();
+
+        if (!conversation) continue;
+
+        const { data: otherMembers } = await supabase
+          .from("stax_conversation_members")
+          .select("account_id")
+          .eq("conversation_id", conversation.id);
+
+        const ids = (otherMembers || []).map((m) => m.account_id).sort();
+        if (ids.length === 2 && ids.includes(targetId) && ids.includes(myId)) {
+          return json({ conversation });
+        }
+      }
+
+      const { data: conversation, error: createError } = await supabase
+        .from("stax_conversations")
+        .insert({ conversation_type: "direct", owner_id: myId })
+        .select("*")
+        .single();
+
+      if (createError) throw createError;
+
+      const { error: addMembersError } = await supabase
+        .from("stax_conversation_members")
+        .insert([
+          { conversation_id: conversation.id, account_id: myId },
+          { conversation_id: conversation.id, account_id: targetId },
+        ]);
+
+      if (addMembersError) throw addMembersError;
+      return json({ conversation }, 201);
+    }
+
+    // Create group
+    if (action === "create_group") {
+      const title = requiredText(body.title, 80);
+      const rawMembers = Array.isArray(body.member_ids) ? body.member_ids : [];
+      const memberIds = [...new Set([myId, ...rawMembers])]
+        .filter((id) => typeof id === "string")
+        .slice(0, 51);
+
+      if (!title) return json({ error: "グループ名を入力してください。" }, 400);
+      if (memberIds.length < 2) {
+        return json({ error: "自分以外のメンバーを指定してください。" }, 400);
+      }
+
+      for (const memberId of memberIds) {
+        if (memberId !== myId &&
+            await blockedEitherWay(supabase, myId, memberId)) {
+          return json({ error: "追加できないメンバーが含まれています。" }, 403);
+        }
+      }
+
+      const { data: conversation, error } = await supabase
+        .from("stax_conversations")
+        .insert({
+          conversation_type: "group",
+          title,
+          owner_id: myId,
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+
+      const { error: membersError } = await supabase
+        .from("stax_conversation_members")
+        .insert(memberIds.map((account_id) => ({
+          conversation_id: conversation.id,
+          account_id,
+        })));
+
+      if (membersError) throw membersError;
+      return json({ conversation }, 201);
+    }
+
+    // Read messages in a conversation
+    if (action === "get_messages") {
+      const conversationId = body.conversation_id;
+      if (typeof conversationId !== "string") {
+        return json({ error: "conversation_id is required" }, 400);
+      }
+
+      if (!await isConversationMember(supabase, conversationId, myId)) {
+        return json({ error: "この会話にはアクセスできません。" }, 403);
+      }
+
+      const { data: members } = await supabase
+        .from("stax_conversation_members")
+        .select("account_id")
+        .eq("conversation_id", conversationId);
+
+      for (const member of members || []) {
+        if (member.account_id !== myId &&
+            await blockedEitherWay(supabase, myId, member.account_id)) {
+          return json({ error: "この会話は利用できません。" }, 403);
+        }
+      }
+
+      const { data: messages, error } = await supabase
+        .from("stax_messages")
+        .select("id,conversation_id,sender_id,content,attachment_url,created_at")
+        .eq("conversation_id", conversationId)
+        .eq("is_deleted", false)
+        .order("created_at", { ascending: true })
+        .limit(200);
+
+      if (error) throw error;
+
+      const { error: readError } = await supabase
+        .from("stax_conversation_members")
+        .update({ last_read_at: new Date().toISOString() })
+        .eq("conversation_id", conversationId)
+        .eq("account_id", myId);
+
+      if (readError) throw readError;
+      return json({ messages: messages || [] });
+    }
+
+    // Send message
+    if (action === "send_message") {
+      const conversationId = body.conversation_id;
+      const content = requiredText(body.text, 10000);
+      const attachmentUrl = requiredText(body.attachment_url, 2048);
+
+      if (typeof conversationId !== "string" || (!content && !attachmentUrl)) {
+        return json({ error: "会話とメッセージ内容を指定してください。" }, 400);
+      }
+
+      if (!await isConversationMember(supabase, conversationId, myId)) {
+        return json({ error: "この会話にはアクセスできません。" }, 403);
+      }
+
+      const { data: members } = await supabase
+        .from("stax_conversation_members")
+        .select("account_id")
+        .eq("conversation_id", conversationId);
+
+      for (const member of members || []) {
+        if (member.account_id !== myId &&
+            await blockedEitherWay(supabase, myId, member.account_id)) {
+          return json({ error: "この会話は利用できません。" }, 403);
+        }
+      }
+
+      const { data: message, error } = await supabase
+        .from("stax_messages")
+        .insert({
+          conversation_id: conversationId,
+          sender_id: myId,
+          content: content || "",
+          attachment_url: attachmentUrl || null,
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+
+      for (const member of members || []) {
+        if (member.account_id !== myId) {
+          await notify(supabase, member.account_id, myId, "message");
+        }
+      }
+
+      await supabase
+        .from("stax_conversations")
+        .update({ updated_at: new Date().toISOString() })
+        .eq("id", conversationId);
+
+      return json({ message }, 201);
+    }
+
+    // Block
+    if (action === "block") {
+      const targetId = body.account_id;
+      if (typeof targetId !== "string" || targetId === myId) {
+        return json({ error: "account_id is invalid" }, 400);
+      }
+
+      const { error } = await supabase.from("stax_blocks").upsert({
+        blocker_id: myId,
+        blocked_id: targetId,
+      }, { onConflict: "blocker_id,blocked_id" });
+
+      if (error) throw error;
+
+      await supabase.from("stax_follows").delete()
+        .eq("follower_id", myId).eq("following_id", targetId);
+      await supabase.from("stax_follows").delete()
+        .eq("follower_id", targetId).eq("following_id", myId);
+
+      return json({ blocked: true });
+    }
+
+    // Unblock
+    if (action === "unblock") {
+      const targetId = body.account_id;
+      if (typeof targetId !== "string") {
+        return json({ error: "account_id is required" }, 400);
+      }
+
+      const { error } = await supabase
+        .from("stax_blocks")
+        .delete()
+        .eq("blocker_id", myId)
+        .eq("blocked_id", targetId);
+
+      if (error) throw error;
+      return json({ blocked: false });
+    }
+
+    // Report account or post
+    if (action === "report") {
+      const reason = requiredText(body.reason, 200);
+      const details = typeof body.details === "string"
+        ? body.details.trim().slice(0, 2000)
+        : "";
+
+      if (!reason) return json({ error: "通報理由を入力してください。" }, 400);
+
+      const accountId = typeof body.account_id === "string"
+        ? body.account_id
+        : null;
+      const postId = typeof body.post_id === "string"
+        ? body.post_id
+        : null;
+
+      if (!accountId && !postId) {
+        return json({ error: "通報対象を指定してください。" }, 400);
+      }
+
+      if (accountId === myId) {
+        return json({ error: "自分自身は通報できません。" }, 400);
+      }
+
+      if (postId) {
+        const { data: post, error } = await supabase
+          .from("stax_posts")
+          .select("id")
+          .eq("id", postId)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (!post) return json({ error: "投稿が見つかりません。" }, 404);
+      }
+
+      const { data: report, error } = await supabase
+        .from("stax_reports")
+        .insert({
+          reporter_id: myId,
+          reported_account_id: accountId,
+          reported_post_id: postId,
+          reason,
+          details,
+        })
+        .select("id,status,created_at")
+        .single();
+
+      if (error) throw error;
+      return json({ report }, 201);
+    }
+
+    // Admin report queue
+    if (action === "admin_reports") {
+      if (!me.is_admin) return json({ error: "管理者権限が必要です。" }, 403);
+
+      const { data, error } = await supabase
+        .from("stax_reports")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(100);
+
+      if (error) throw error;
+      return json({ reports: data || [] });
+    }
+
+    // Admin account ban / unban
+    if (action === "admin_ban") {
+      if (!me.is_admin) return json({ error: "管理者権限が必要です。" }, 403);
+
+      const targetId = body.account_id;
+      const banned = body.banned === true;
+      const reason = typeof body.reason === "string"
+        ? body.reason.trim().slice(0, 500)
+        : "";
+
+      if (typeof targetId !== "string" || targetId === myId) {
+        return json({ error: "対象アカウントが不正です。" }, 400);
+      }
+
+      const { data: target, error: targetError } = await supabase
+        .from("stax_accounts")
+        .select("id")
+        .eq("id", targetId)
+        .maybeSingle();
+
+      if (targetError) throw targetError;
+      if (!target) return json({ error: "ユーザーが見つかりません。" }, 404);
+
+      const { error } = await supabase
+        .from("stax_accounts")
+        .update({
+          is_banned: banned,
+          ban_reason: banned ? reason : null,
+        })
+        .eq("id", targetId);
+
+      if (error) throw error;
+
+      const { error: logError } = await supabase
+        .from("stax_admin_logs")
+        .insert({
+          admin_id: myId,
+          action: banned ? "ban_account" : "unban_account",
+          target_account_id: targetId,
+          details: { reason },
+        });
+
+      if (logError) throw logError;
+
+      if (banned) {
+        const { error: sessionError } = await supabase
+          .from("stax_sessions")
+          .delete()
+          .eq("account_id", targetId);
+        if (sessionError) throw sessionError;
+      }
+
+      return json({ success: true, banned });
+    }
+
+    return json({ error: "Unknown action", action }, 400);
+  } catch (error) {
+    console.error("stax-api error:", error);
+    return json({ error: "サーバー処理に失敗しました。" }, 500);
+  }
+});
