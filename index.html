@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#080b10">
 <title>Stax — Share your world</title>
+<link rel="icon" href="stax.png" sizes="16x16" type="image/png" />  
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root {
@@ -189,7 +190,7 @@ textarea { min-height:100px;resize:vertical }
       <div class="row">
         <div class="avatar" id="myAvatar">S</div>
         <div style="flex:1">
-          <textarea id="postText" maxlength="2000" placeholder="いま、どうしてる？"></textarea>
+          <textarea id="postText" maxlength="2000" placeholder="いま、スターしてる？"></textarea>
         </div>
       </div>
       <div class="row between" style="margin-top:10px">
@@ -502,7 +503,7 @@ textarea { min-height:100px;resize:vertical }
       '<button class="action" data-author-profile>プロフィール</button></div>' +
       '<div class="post-text">' + escapeHTML(post.text || post.content || "") + '</div>' +
       '<div class="actions"><button class="action" data-action="reply">返信</button>' +
-      '<button class="action" data-action="repost">' + (post.reposted_by_me ? 'リポスト済み' : 'リポスト') + '</button>' +
+      '<button class="action" data-action="repost">' + (post.reposted_by_me ? 'リスター済み' : 'リスター') + '</button>' +
       '<button class="action" data-action="like">' + (post.liked_by_me ? '♥ いいね済み' : '♡ いいね') + '</button></div>';
     article.querySelector('[data-author-profile]').addEventListener('click', () => {
       if (!post.user_id) return;
