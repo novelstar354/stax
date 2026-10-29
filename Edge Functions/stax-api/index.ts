@@ -118,6 +118,15 @@ async function isFollowing(
   return Boolean(data);
 }
 
+async function isMutualFollowing(
+  supabase: ReturnType<typeof db>,
+  a: string,
+  b: string,
+) {
+  return (await isFollowing(supabase, a, b)) &&
+    (await isFollowing(supabase, b, a));
+}
+
 async function isConversationMember(
   supabase: ReturnType<typeof db>,
   conversationId: string,
@@ -187,6 +196,7 @@ Deno.serve(async (request: Request) => {
           bio,
           website: website || null,
           avatar_url: avatarUrl || null,
+          ...(typeof body.is_private === "boolean" ? { is_private: body.is_private } : {}),
           updated_at: new Date().toISOString(),
         })
         .eq("id", myId)
@@ -195,6 +205,38 @@ Deno.serve(async (request: Request) => {
 
       if (error) throw error;
       return json({ user });
+    }
+
+    // Upload profile avatar to the public Supabase Storage bucket "stax-avatars".
+    // Client sends data_url: "data:image/png;base64,..." (max 2 MiB).
+    if (action === "upload_avatar") {
+      const dataUrl = typeof body.data_url === "string" ? body.data_url : "";
+      const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$/);
+      if (!match) return json({ error: "PNG/JPEG/WEBP/GIF画像を選択してください。" }, 400);
+      const mime = match[1];
+      let binary: string;
+      try { binary = atob(match[2]); } catch { return json({ error: "画像データが不正です。" }, 400); }
+      if (binary.length < 1 || binary.length > 2 * 1024 * 1024) {
+        return json({ error: "画像は2MB以下にしてください。" }, 413);
+      }
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const ext = mime === "image/jpeg" ? "jpg" : mime.split("/")[1];
+      const path = `${myId}/${crypto.randomUUID()}.${ext}`;
+      const { error: uploadError } = await supabase.storage
+        .from("stax-avatars")
+        .upload(path, bytes, { contentType: mime, upsert: false, cacheControl: "3600" });
+      if (uploadError) throw uploadError;
+      const { data: publicData } = supabase.storage.from("stax-avatars").getPublicUrl(path);
+      const avatarUrl = publicData.publicUrl;
+      const { data: user, error: updateError } = await supabase
+        .from("stax_accounts")
+        .update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() })
+        .eq("id", myId)
+        .select("id,user_id,display_name,bio,website,avatar_url,is_private,is_banned,is_admin,updated_at")
+        .single();
+      if (updateError) throw updateError;
+      return json({ user, avatar_url: avatarUrl });
     }
 
     // Own profile and posts
@@ -636,20 +678,102 @@ Deno.serve(async (request: Request) => {
       return json({ following: true });
     }
 
+    // Incoming follow requests for private accounts
+    if (action === "follow_requests") {
+      const { data: requests, error } = await supabase
+        .from("stax_follow_requests")
+        .select("id,requester_id,target_id,status,created_at")
+        .eq("target_id", myId)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (error) throw error;
+      const result = [];
+      for (const request of requests || []) {
+        if (await blockedEitherWay(supabase, myId, request.requester_id)) continue;
+        const { data: requester, error: requesterError } = await supabase
+          .from("stax_accounts")
+          .select("id,user_id,display_name,avatar_url,bio")
+          .eq("id", request.requester_id)
+          .eq("is_banned", false)
+          .maybeSingle();
+        if (requesterError) throw requesterError;
+        if (requester) result.push({ ...request, requester });
+      }
+      return json({ requests: result });
+    }
+
+    // Accept a pending follow request addressed to the current account
+    if (action === "accept_follow_request") {
+      const requestId = body.request_id;
+      if (typeof requestId !== "string") return json({ error: "request_id is required" }, 400);
+      const { data: request, error: requestError } = await supabase
+        .from("stax_follow_requests")
+        .select("id,requester_id,target_id,status")
+        .eq("id", requestId)
+        .eq("target_id", myId)
+        .eq("status", "pending")
+        .maybeSingle();
+      if (requestError) throw requestError;
+      if (!request) return json({ error: "有効なフォロー申請が見つかりません。" }, 404);
+      if (await blockedEitherWay(supabase, myId, request.requester_id)) {
+        return json({ error: "このユーザーの申請は承認できません。" }, 403);
+      }
+      const { error: followError } = await supabase.from("stax_follows").upsert({
+        follower_id: request.requester_id, following_id: myId,
+      }, { onConflict: "follower_id,following_id" });
+      if (followError) throw followError;
+      const { error: updateError } = await supabase
+        .from("stax_follow_requests")
+        .update({ status: "accepted" })
+        .eq("id", requestId)
+        .eq("target_id", myId);
+      if (updateError) throw updateError;
+      await notify(supabase, request.requester_id, myId, "follow_accepted");
+      return json({ success: true, accepted: true, account_id: request.requester_id });
+    }
+
+    // Reject a pending follow request
+    if (action === "reject_follow_request") {
+      const requestId = body.request_id;
+      if (typeof requestId !== "string") return json({ error: "request_id is required" }, 400);
+      const { data: request, error: requestError } = await supabase
+        .from("stax_follow_requests")
+        .select("id")
+        .eq("id", requestId)
+        .eq("target_id", myId)
+        .eq("status", "pending")
+        .maybeSingle();
+      if (requestError) throw requestError;
+      if (!request) return json({ error: "有効なフォロー申請が見つかりません。" }, 404);
+      const { error } = await supabase.from("stax_follow_requests")
+        .update({ status: "rejected" }).eq("id", requestId).eq("target_id", myId);
+      if (error) throw error;
+      return json({ success: true, rejected: true });
+    }
+
     // Search accounts / posts / hashtags
     if (action === "search") {
       const query = requiredText(body.query, 100);
       if (!query) return json({ accounts: [], posts: [], hashtags: [] });
 
       const safeQuery = query.replace(/[%_\\]/g, "\\$&");
-      const { data: accounts, error: accountError } = await supabase
+      const { data: accountsById, error: accountIdError } = await supabase
         .from("stax_accounts")
         .select("id,user_id,display_name,avatar_url,bio,is_private")
         .ilike("user_id", `%${safeQuery}%`)
         .eq("is_banned", false)
         .limit(20);
-
-      if (accountError) throw accountError;
+      if (accountIdError) throw accountIdError;
+      const { data: accountsByName, error: accountNameError } = await supabase
+        .from("stax_accounts")
+        .select("id,user_id,display_name,avatar_url,bio,is_private")
+        .ilike("display_name", `%${safeQuery}%`)
+        .eq("is_banned", false)
+        .limit(20);
+      if (accountNameError) throw accountNameError;
+      const accounts = [...new Map([...(accountsById || []), ...(accountsByName || [])]
+        .map((account) => [account.id, account])).values()];
 
       const { data: posts, error: postError } = await supabase
         .from("stax_posts")
@@ -673,6 +797,9 @@ Deno.serve(async (request: Request) => {
 
         if (!author) continue;
         if (author.is_private && post.author_id !== myId &&
+            !(await isFollowing(supabase, myId, post.author_id))) continue;
+        if (post.visibility === "private" && post.author_id !== myId) continue;
+        if (post.visibility === "followers" && post.author_id !== myId &&
             !(await isFollowing(supabase, myId, post.author_id))) continue;
 
         const { count: likeCount, error: likeCountError } = await supabase
@@ -717,10 +844,64 @@ Deno.serve(async (request: Request) => {
 
       if (tagError) throw tagError;
 
+      // If searching a hashtag, include posts linked to that hashtag even when
+      // punctuation/spacing means a plain content search would miss them.
+      if (query.startsWith("#")) {
+        const exactTag = query.slice(1).toLowerCase();
+        const { data: exactHashtag, error: exactTagError } = await supabase
+          .from("stax_hashtags").select("id,tag").eq("tag", exactTag).maybeSingle();
+        if (exactTagError) throw exactTagError;
+        if (exactHashtag) {
+          const { data: links, error: linksError } = await supabase
+            .from("stax_post_hashtags").select("post_id")
+            .eq("hashtag_id", exactHashtag.id).limit(100);
+          if (linksError) throw linksError;
+          const ids = (links || []).map((link) => link.post_id);
+          if (ids.length) {
+            const { data: taggedPosts, error: taggedError } = await supabase
+              .from("stax_posts")
+              .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
+              .in("id", ids).eq("is_deleted", false)
+              .order("created_at", { ascending: false }).limit(50);
+            if (taggedError) throw taggedError;
+            for (const post of taggedPosts || []) {
+              if (visiblePosts.some((item) => item.id === post.id)) continue;
+              if (await blockedEitherWay(supabase, myId, post.author_id)) continue;
+              const { data: author } = await supabase.from("stax_accounts")
+                .select("user_id,display_name,is_private")
+                .eq("id", post.author_id).maybeSingle();
+              if (!author) continue;
+              if (author.is_private && post.author_id !== myId && !(await isFollowing(supabase, myId, post.author_id))) continue;
+              if (post.visibility === "private" && post.author_id !== myId) continue;
+              if (post.visibility === "followers" && post.author_id !== myId && !(await isFollowing(supabase, myId, post.author_id))) continue;
+              visiblePosts.push({ ...post, user_id: author.user_id, display_name: author.display_name });
+            }
+          }
+        }
+      }
+
+      const searchAccounts = [];
+      for (const account of accounts) {
+        if (account.id !== myId && await blockedEitherWay(supabase, myId, account.id)) continue;
+        const following_by_me = account.id === myId ? false : await isFollowing(supabase, myId, account.id);
+        const { data: request, error: requestError } = account.id === myId
+          ? { data: null, error: null }
+          : await supabase.from("stax_follow_requests")
+              .select("id,status")
+              .eq("requester_id", myId)
+              .eq("target_id", account.id)
+              .eq("status", "pending")
+              .maybeSingle();
+        if (requestError) throw requestError;
+        searchAccounts.push({
+          ...account,
+          following_by_me,
+          requested_by_me: Boolean(request),
+        });
+      }
+
       return json({
-        accounts: (accounts || []).filter(
-          (a) => a.id === myId || !a.is_private
-        ),
+        accounts: searchAccounts,
         posts: visiblePosts,
         hashtags: hashtags || [],
       });
@@ -787,6 +968,10 @@ Deno.serve(async (request: Request) => {
         const memberIds = (members || []).map((m) => m.account_id);
         if (memberIds.some((id) => id !== myId &&
             blockedEitherWay(supabase, myId, id))) continue;
+        if (conversation.conversation_type === "direct") {
+          const otherId = memberIds.find((id) => id !== myId);
+          if (!otherId || !await isMutualFollowing(supabase, myId, otherId)) continue;
+        }
 
         conversations.push({
           ...conversation,
@@ -818,6 +1003,10 @@ Deno.serve(async (request: Request) => {
       if (targetError) throw targetError;
       if (!target || target.is_banned) {
         return json({ error: "ユーザーが見つかりません。" }, 404);
+      }
+
+      if (!await isMutualFollowing(supabase, myId, targetId)) {
+        return json({ error: "DMは相互フォロー中のユーザーとのみ利用できます。" }, 403);
       }
 
       const { data: existingMemberships, error: membershipError } =
@@ -927,6 +1116,20 @@ Deno.serve(async (request: Request) => {
         .select("account_id")
         .eq("conversation_id", conversationId);
 
+      const { data: conversationInfo, error: conversationInfoError } = await supabase
+        .from("stax_conversations")
+        .select("id,conversation_type")
+        .eq("id", conversationId)
+        .maybeSingle();
+      if (conversationInfoError) throw conversationInfoError;
+      if (!conversationInfo) return json({ error: "会話が見つかりません。" }, 404);
+      if (conversationInfo.conversation_type === "direct") {
+        const otherId = (members || []).map((m) => m.account_id).find((id) => id !== myId);
+        if (!otherId || !await isMutualFollowing(supabase, myId, otherId)) {
+          return json({ error: "DMは相互フォロー中のみ利用できます。" }, 403);
+        }
+      }
+
       for (const member of members || []) {
         if (member.account_id !== myId &&
             await blockedEitherWay(supabase, myId, member.account_id)) {
@@ -972,6 +1175,20 @@ Deno.serve(async (request: Request) => {
         .from("stax_conversation_members")
         .select("account_id")
         .eq("conversation_id", conversationId);
+
+      const { data: conversationInfo, error: conversationInfoError } = await supabase
+        .from("stax_conversations")
+        .select("id,conversation_type")
+        .eq("id", conversationId)
+        .maybeSingle();
+      if (conversationInfoError) throw conversationInfoError;
+      if (!conversationInfo) return json({ error: "会話が見つかりません。" }, 404);
+      if (conversationInfo.conversation_type === "direct") {
+        const otherId = (members || []).map((m) => m.account_id).find((id) => id !== myId);
+        if (!otherId || !await isMutualFollowing(supabase, myId, otherId)) {
+          return json({ error: "DMは相互フォロー中のみ利用できます。" }, 403);
+        }
+      }
 
       for (const member of members || []) {
         if (member.account_id !== myId &&
