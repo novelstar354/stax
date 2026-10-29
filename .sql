@@ -15,9 +15,10 @@ SET
 WHERE user_id = '対象ユーザーID';
 
 --password reset
-UPDATE public.stax_accounts
-SET password_reset_required = TRUE
-WHERE user_id = '対象ユーザーID';
+SELECT public.stax_admin_reset_password(
+    '変更対象のユーザーID',
+    '新しいパスワード'
+);
 
 --list
 SELECT
