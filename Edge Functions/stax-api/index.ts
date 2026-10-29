@@ -195,7 +195,7 @@ Deno.serve(async (request: Request) => {
           display_name: displayName,
           bio,
           website: website || null,
-          avatar_url: avatarUrl || null,
+          ...(Object.prototype.hasOwnProperty.call(body, "avatar_url") ? { avatar_url: avatarUrl || null } : {}),
           ...(typeof body.is_private === "boolean" ? { is_private: body.is_private } : {}),
           updated_at: new Date().toISOString(),
         })
@@ -239,61 +239,94 @@ Deno.serve(async (request: Request) => {
       return json({ user, avatar_url: avatarUrl });
     }
 
-    // Own profile and posts
+    // Public profile by user_id (or own profile when omitted), plus privacy-aware posts.
     if (action === "profile") {
-      const { data: user, error: userError } = await supabase
-        .from("stax_accounts")
+      const requestedUserId = typeof body.user_id === "string" ? body.user_id.trim() : "";
+      let userQuery = supabase.from("stax_accounts")
         .select("id,user_id,display_name,bio,website,avatar_url,is_private,created_at")
-        .eq("id", myId)
-        .single();
+        .eq("is_banned", false);
+      userQuery = requestedUserId ? userQuery.eq("user_id", requestedUserId) : userQuery.eq("id", myId);
+      const { data: user, error: userError } = await userQuery.maybeSingle();
       if (userError) throw userError;
-
-      const { data: posts, error: postsError } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
-        .eq("author_id", myId)
-        .eq("is_deleted", false)
-        .order("is_pinned", { ascending: false })
-        .order("created_at", { ascending: false })
-        .limit(100);
-      if (postsError) throw postsError;
-
-      const resultPosts = [];
-      for (const post of posts || []) {
-        const { count: likes, error: likesError } = await supabase
-          .from("stax_likes")
-          .select("post_id", { count: "exact", head: true })
-          .eq("post_id", post.id);
-        if (likesError) throw likesError;
-
-        const { data: liked, error: likedError } = await supabase
-          .from("stax_likes")
-          .select("post_id")
-          .eq("post_id", post.id)
-          .eq("account_id", myId)
-          .maybeSingle();
-        if (likedError) throw likedError;
-
-        const { data: repost, error: repostError } = await supabase
-          .from("stax_posts")
-          .select("id")
-          .eq("author_id", myId)
-          .eq("repost_of_id", post.id)
-          .eq("is_deleted", false)
-          .maybeSingle();
-        if (repostError) throw repostError;
-
-        resultPosts.push({
-          ...post,
-          user_id: user.user_id,
-          display_name: user.display_name,
-          avatar_url: user.avatar_url,
-          like_count: likes || 0,
-          liked_by_me: Boolean(liked),
-          reposted_by_me: Boolean(repost),
-        });
+      if (!user) return json({ error: "プロフィールが見つかりません。" }, 404);
+      if (user.id !== myId && await blockedEitherWay(supabase, myId, user.id)) {
+        return json({ error: "このプロフィールは表示できません。" }, 403);
       }
-      return json({ user, posts: resultPosts });
+
+      const following_by_me = user.id === myId ? false : await isFollowing(supabase, myId, user.id);
+      const followed_by_me = user.id === myId ? false : await isFollowing(supabase, user.id, myId);
+      const { data: pendingRequest, error: pendingError } = user.id === myId
+        ? { data: null, error: null }
+        : await supabase.from("stax_follow_requests").select("id,status")
+            .eq("requester_id", myId).eq("target_id", user.id).eq("status", "pending").maybeSingle();
+      if (pendingError) throw pendingError;
+
+      const { count: followersCount, error: followersError } = await supabase.from("stax_follows")
+        .select("follower_id", { count: "exact", head: true }).eq("following_id", user.id);
+      if (followersError) throw followersError;
+      const { count: followingCount, error: followingError } = await supabase.from("stax_follows")
+        .select("following_id", { count: "exact", head: true }).eq("follower_id", user.id);
+      if (followingError) throw followingError;
+
+      const privateLocked = Boolean(user.is_private && user.id !== myId && !following_by_me);
+      const posts = [];
+      if (!privateLocked) {
+        const { data: rows, error: postsError } = await supabase.from("stax_posts")
+          .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
+          .eq("author_id", user.id).eq("is_deleted", false)
+          .order("is_pinned", { ascending: false }).order("created_at", { ascending: false }).limit(100);
+        if (postsError) throw postsError;
+        for (const post of rows || []) {
+          if (post.visibility === "private" && user.id !== myId) continue;
+          if (post.visibility === "followers" && user.id !== myId && !following_by_me) continue;
+          const { count: likes, error: likesError } = await supabase.from("stax_likes")
+            .select("post_id", { count: "exact", head: true }).eq("post_id", post.id);
+          if (likesError) throw likesError;
+          const { data: liked, error: likedError } = await supabase.from("stax_likes")
+            .select("post_id").eq("post_id", post.id).eq("account_id", myId).maybeSingle();
+          if (likedError) throw likedError;
+          const { data: repost, error: repostError } = await supabase.from("stax_posts")
+            .select("id").eq("author_id", myId).eq("repost_of_id", post.id).eq("is_deleted", false).maybeSingle();
+          if (repostError) throw repostError;
+          posts.push({ ...post, user_id: user.user_id, display_name: user.display_name,
+            avatar_url: user.avatar_url, like_count: likes || 0,
+            liked_by_me: Boolean(liked), reposted_by_me: Boolean(repost) });
+        }
+      }
+      return json({ user, posts, private_locked: privateLocked,
+        following_by_me, followed_by_me, requested_by_me: Boolean(pendingRequest),
+        followers_count: followersCount || 0, following_count: followingCount || 0,
+        is_me: user.id === myId });
+    }
+
+    // Followers / following list for a visible profile.
+    if (action === "follow_list") {
+      const targetId = typeof body.account_id === "string" ? body.account_id : myId;
+      const kind = body.kind === "following" ? "following" : "followers";
+      if (await blockedEitherWay(supabase, myId, targetId)) return json({ error: "この一覧は表示できません。" }, 403);
+      const { data: target, error: targetError } = await supabase.from("stax_accounts")
+        .select("id,is_private").eq("id", targetId).eq("is_banned", false).maybeSingle();
+      if (targetError) throw targetError;
+      if (!target) return json({ error: "ユーザーが見つかりません。" }, 404);
+      const amFollowing = targetId === myId || await isFollowing(supabase, myId, targetId);
+      if (target.is_private && targetId !== myId && !amFollowing) {
+        return json({ error: "鍵アカウントをフォローすると一覧を見られます。" }, 403);
+      }
+      const column = kind === "following" ? "follower_id" : "following_id";
+      const { data: relations, error } = await supabase.from("stax_follows")
+        .select("follower_id,following_id,created_at").eq(column, targetId).order("created_at", { ascending: false }).limit(100);
+      if (error) throw error;
+      const ids = (relations || []).map((r) => kind === "following" ? r.following_id : r.follower_id);
+      const accounts = [];
+      for (const id of ids) {
+        if (await blockedEitherWay(supabase, myId, id)) continue;
+        const { data: account, error: accountError } = await supabase.from("stax_accounts")
+          .select("id,user_id,display_name,avatar_url,is_private").eq("id", id).eq("is_banned", false).maybeSingle();
+        if (accountError) throw accountError;
+        if (!account) continue;
+        accounts.push({ ...account, following_by_me: id === myId ? false : await isFollowing(supabase, myId, id) });
+      }
+      return json({ accounts, kind });
     }
 
     // Delete own post or reply (soft-delete)
@@ -657,6 +690,18 @@ Deno.serve(async (request: Request) => {
         return json({ following: false });
       }
 
+      const { data: pendingRequest, error: pendingRequestError } = await supabase
+        .from("stax_follow_requests").select("id")
+        .eq("requester_id", myId).eq("target_id", targetId)
+        .eq("status", "pending").maybeSingle();
+      if (pendingRequestError) throw pendingRequestError;
+      if (pendingRequest) {
+        const { error: cancelError } = await supabase.from("stax_follow_requests")
+          .delete().eq("id", pendingRequest.id).eq("requester_id", myId);
+        if (cancelError) throw cancelError;
+        return json({ requested: false, canceled_request: true });
+      }
+
       if (target.is_private) {
         const { error } = await supabase.from("stax_follow_requests").upsert({
           requester_id: myId,
@@ -940,6 +985,38 @@ Deno.serve(async (request: Request) => {
       return json({ success: true });
     }
 
+    // Users who can receive a direct message: mutual follows, excluding blocked accounts.
+    if (action === "dm_candidates") {
+      const { data: followingRows, error: followingError } = await supabase
+        .from("stax_follows")
+        .select("following_id")
+        .eq("follower_id", myId);
+      if (followingError) throw followingError;
+
+      const accounts = [];
+      const seen = new Set<string>();
+      for (const row of followingRows || []) {
+        const targetId = row.following_id;
+        if (!targetId || targetId === myId || seen.has(targetId)) continue;
+        seen.add(targetId);
+        if (!await isFollowing(supabase, targetId, myId)) continue;
+        if (await blockedEitherWay(supabase, myId, targetId)) continue;
+
+        const { data: account, error: accountError } = await supabase
+          .from("stax_accounts")
+          .select("id,user_id,display_name,avatar_url,is_private")
+          .eq("id", targetId)
+          .eq("is_banned", false)
+          .maybeSingle();
+        if (accountError) throw accountError;
+        if (account) accounts.push(account);
+      }
+      accounts.sort((a, b) =>
+        (a.display_name || a.user_id).localeCompare(b.display_name || b.user_id, "ja")
+      );
+      return json({ accounts });
+    }
+
     // Direct-message conversations list
     if (action === "messages" || action === "conversations") {
       const { data: memberships, error: memberError } = await supabase
@@ -966,15 +1043,38 @@ Deno.serve(async (request: Request) => {
           .eq("conversation_id", conversation.id);
 
         const memberIds = (members || []).map((m) => m.account_id);
-        if (memberIds.some((id) => id !== myId &&
-            blockedEitherWay(supabase, myId, id))) continue;
+        let hasBlockedMember = false;
+        for (const id of memberIds) {
+          if (id !== myId && await blockedEitherWay(supabase, myId, id)) {
+            hasBlockedMember = true;
+            break;
+          }
+        }
+        if (hasBlockedMember) continue;
         if (conversation.conversation_type === "direct") {
           const otherId = memberIds.find((id) => id !== myId);
           if (!otherId || !await isMutualFollowing(supabase, myId, otherId)) continue;
         }
 
+        const participantAccounts = [];
+        for (const accountId of memberIds) {
+          const { data: account, error: accountError } = await supabase
+            .from("stax_accounts")
+            .select("id,user_id,display_name,avatar_url")
+            .eq("id", accountId)
+            .maybeSingle();
+          if (accountError) throw accountError;
+          if (account) participantAccounts.push(account);
+        }
+        const otherAccounts = participantAccounts.filter((account) => account.id !== myId);
+        const displayTitle = conversation.conversation_type === "direct"
+          ? (otherAccounts[0]?.display_name || otherAccounts[0]?.user_id || "ユーザー不明")
+          : (conversation.title || "グループ");
+
         conversations.push({
           ...conversation,
+          display_title: displayTitle,
+          participants: participantAccounts,
           last_read_at: member.last_read_at,
           is_muted: member.is_muted,
         });
@@ -1154,7 +1254,28 @@ Deno.serve(async (request: Request) => {
         .eq("account_id", myId);
 
       if (readError) throw readError;
-      return json({ messages: messages || [] });
+
+      const senderIds = [...new Set((messages || []).map((message) => message.sender_id).filter(Boolean))];
+      const senderAccounts = new Map();
+      for (const senderId of senderIds) {
+        const { data: account, error: accountError } = await supabase
+          .from("stax_accounts")
+          .select("id,user_id,display_name,avatar_url")
+          .eq("id", senderId)
+          .maybeSingle();
+        if (accountError) throw accountError;
+        if (account) senderAccounts.set(senderId, account);
+      }
+      const messagesWithSender = (messages || []).map((message) => {
+        const sender = senderAccounts.get(message.sender_id);
+        return {
+          ...message,
+          sender_user_id: sender?.user_id || "unknown",
+          sender_display_name: sender?.display_name || sender?.user_id || "不明なユーザー",
+          sender_avatar_url: sender?.avatar_url || null,
+        };
+      });
+      return json({ messages: messagesWithSender });
     }
 
     // Send message
