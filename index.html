@@ -1,1174 +1,800 @@
 
-import { createClient } from "npm:@supabase/supabase-js@2";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
-
-const json = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
-
-const env = (name: string) => {
-  const value = Deno.env.get(name);
-  if (!value) throw new Error(`Missing environment variable: ${name}`);
-  return value;
-};
-
-const db = () =>
-  createClient(
-    env("SUPABASE_URL"),
-    env("SUPABASE_SERVICE_ROLE_KEY"),
-    { auth: { persistSession: false, autoRefreshToken: false } },
-  );
-
-async function sha256(value: string): Promise<string> {
-  const hash = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(value),
-  );
-  return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#080b10">
+<title>Stax — Share your world</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+:root {
+  color-scheme: dark;
+  --bg:#080b10;
+  --panel:#101722;
+  --line:#253246;
+  --text:#f4f7fb;
+  --muted:#8b9bb0;
+  --blue:#3984ff;
 }
-
-function requiredText(value: unknown, max = 2000): string | null {
-  if (typeof value !== "string") return null;
-  const result = value.trim();
-  return result.length > 0 && result.length <= max ? result : null;
+* { box-sizing:border-box }
+body {
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font:15px system-ui,sans-serif;
 }
-
-async function authenticate(request: Request, supabase: ReturnType<typeof db>) {
-  const header = request.headers.get("Authorization") || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-  if (!token || token.length > 512) return null;
-
-  const tokenHash = await sha256(token);
-  const { data: session, error } = await supabase
-    .from("stax_sessions")
-    .select("account_id")
-    .eq("token_hash", tokenHash)
-    .gt("expires_at", new Date().toISOString())
-    .maybeSingle();
-
-  if (error || !session) return null;
-
-  const { data: account, error: accountError } = await supabase
-    .from("stax_accounts")
-    .select("id,user_id,display_name,is_private,is_banned,is_admin")
-    .eq("id", session.account_id)
-    .maybeSingle();
-
-  if (accountError || !account || account.is_banned) return null;
-  return { account, tokenHash };
+button,input,textarea { font:inherit }
+button { cursor:pointer }
+button:focus-visible,input:focus-visible,textarea:focus-visible {
+  outline:2px solid var(--blue);
+  outline-offset:2px;
 }
-
-async function blockedEitherWay(
-  supabase: ReturnType<typeof db>,
-  a: string,
-  b: string,
-) {
-  const { data, error } = await supabase
-    .from("stax_blocks")
-    .select("blocker_id")
-    .or(`and(blocker_id.eq.${a},blocked_id.eq.${b}),and(blocker_id.eq.${b},blocked_id.eq.${a})`)
-    .limit(1);
-
-  if (error) throw error;
-  return Boolean(data?.length);
+.app {
+  width:min(1100px,100%);
+  min-height:100vh;
+  margin:auto;
+  display:grid;
+  grid-template-columns:220px minmax(0,600px) 240px;
 }
-
-async function notify(
-  supabase: ReturnType<typeof db>,
-  recipientId: string,
-  actorId: string,
-  type: string,
-  postId?: string,
-) {
-  if (recipientId === actorId) return;
-
-  const { error } = await supabase.from("stax_notifications").insert({
-    recipient_id: recipientId,
-    actor_id: actorId,
-    notification_type: type,
-    post_id: postId ?? null,
-  });
-
-  if (error) throw error;
+.sidebar,.rightbar { padding:20px 14px }
+.sidebar { border-right:1px solid var(--line) }
+.rightbar { border-left:1px solid var(--line) }
+.logo { font-size:30px;font-weight:850;letter-spacing:-1px }
+.logo span { color:var(--blue) }
+.nav {
+  display:block;width:100%;text-align:left;
+  padding:13px;margin-top:8px;border:0;
+  border-radius:12px;background:transparent;color:var(--text)
 }
-
-async function isFollowing(
-  supabase: ReturnType<typeof db>,
-  followerId: string,
-  followingId: string,
-) {
-  const { data, error } = await supabase
-    .from("stax_follows")
-    .select("follower_id")
-    .eq("follower_id", followerId)
-    .eq("following_id", followingId)
-    .maybeSingle();
-
-  if (error) throw error;
-  return Boolean(data);
+.nav:hover,.nav.active { background:#18263a }
+.main { min-width:0 }
+.top {
+  padding:18px 20px;
+  border-bottom:1px solid var(--line);
+  font-size:20px;font-weight:750;
 }
-
-async function isConversationMember(
-  supabase: ReturnType<typeof db>,
-  conversationId: string,
-  accountId: string,
-) {
-  const { data, error } = await supabase
-    .from("stax_conversation_members")
-    .select("account_id")
-    .eq("conversation_id", conversationId)
-    .eq("account_id", accountId)
-    .maybeSingle();
-
-  if (error) throw error;
-  return Boolean(data);
+.panel { padding:18px 20px;border-bottom:1px solid var(--line) }
+textarea,input {
+  width:100%;background:#0b111a;color:var(--text);
+  border:1px solid var(--line);border-radius:12px;
+  padding:12px;
 }
+textarea { min-height:100px;resize:vertical }
+.row { display:flex;gap:10px;align-items:center }
+.row.between { justify-content:space-between }
+.btn {
+  background:var(--blue);color:white;border:0;
+  border-radius:999px;padding:10px 17px;font-weight:700;
+}
+.btn.secondary { background:#18263a }
+.post { padding:18px 20px;border-bottom:1px solid var(--line) }
+.post-head { display:flex;gap:10px;align-items:center;margin-bottom:10px }
+.avatar {
+  width:42px;height:42px;border-radius:50%;
+  background:#1d3760;display:grid;place-items:center;
+  font-weight:800;color:#b9d5ff;flex-shrink:0;
+}
+.muted { color:var(--muted);font-size:13px }
+.post-text { white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65 }
+.actions { display:flex;justify-content:space-between;gap:8px;margin-top:14px }
+.action { background:transparent;border:0;color:var(--muted);padding:6px }
+.action:hover { color:var(--blue) }
+.searchbox { margin-bottom:12px }
+.notice { color:var(--muted);font-size:13px;line-height:1.7 }
+#status { margin-top:10px;font-size:13px;color:#a9caff }
+.auth { max-width:420px;margin:8vh auto;padding:22px }
+.auth h1 { font-size:36px;margin-bottom:4px }
+.auth input { margin:7px 0 }
+.hidden { display:none!important }
+@media(max-width:850px) {
+  .app { grid-template-columns:76px minmax(0,1fr) }
+  .sidebar { padding:16px 8px }
+  .logo { text-align:center;font-size:24px }
+  .nav { text-align:center;padding:12px 2px;font-size:12px }
+  .rightbar { display:none }
+}
+@media(max-width:520px) {
+  .app { display:block;padding-bottom:65px }
+  .sidebar {
+    position:fixed;z-index:5;bottom:0;left:0;right:0;
+    height:62px;background:var(--bg);border-right:0;
+    border-top:1px solid var(--line);display:flex;
+    justify-content:space-around;padding:5px;
+  }
+  .logo { display:none }
+  .nav { width:auto;flex:1;margin:0;padding:8px 2px }
+  .top { padding:15px }
+  .panel,.post { padding:15px }
+  .auth { margin:4vh auto;padding:18px }
+}
+</style>
+</head>
+<body>
 
-Deno.serve(async (request: Request) => {
-  if (request.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+<section id="auth" class="auth">
+  <h1 class="logo">Stax<span>.</span></h1>
+  <p class="muted">Share your world.</p>
+  <div class="panel" style="padding:16px 0;border:0">
+    <h2 id="authTitle">ログイン</h2>
+    <input id="displayName" placeholder="表示名（新規登録時）" maxlength="40" class="hidden">
+    <input id="userId" placeholder="Stax ID" autocomplete="username" maxlength="20">
+    <input id="password" placeholder="パスワード" type="password" autocomplete="current-password">
+    <button class="btn" id="authButton" style="width:100%;margin-top:10px">ログイン</button>
+    <button class="nav" id="switchAuth">アカウントを新規登録</button>
+    <div id="authStatus" role="status"></div>
+  </div>
+</section>
+
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="logo">S<span>.</span></div>
+    <button class="nav active" data-page="home">⌂ ホーム</button>
+    <button class="nav" data-page="search">⌕ 検索</button>
+    <button class="nav" data-page="notifications">♧ 通知</button>
+    <button class="nav" data-page="messages">✉ DM</button>
+    <button class="nav" data-page="profile">◉ プロフィール</button>
+    <button class="nav" data-page="settings">⚙ 設定</button>
+    <button class="nav" id="accountSwitch">⇄ アカウント切替</button>
+    <button class="nav" id="logout">↪ ログアウト</button>
+  </aside>
+
+  <main class="main">
+    <div class="top" id="pageTitle">ホーム</div>
+    <section id="composer" class="panel">
+      <div class="row">
+        <div class="avatar" id="myAvatar">S</div>
+        <div style="flex:1">
+          <textarea id="postText" maxlength="2000" placeholder="いま、どうしてる？"></textarea>
+        </div>
+      </div>
+      <div class="row between" style="margin-top:10px">
+        <span class="muted" id="charCount">0 / 2000</span>
+        <button class="btn" id="publish">投稿する</button>
+      </div>
+    </section>
+    <section id="content" aria-live="polite">
+      <div class="panel muted">タイムラインを読み込む準備ができました。</div>
+    </section>
+  </main>
+
+  <aside class="rightbar">
+    <input id="searchInput" class="searchbox" placeholder="ユーザー・投稿を検索">
+    <div class="panel" style="border:1px solid var(--line);border-radius:14px">
+      <strong>Staxへようこそ</strong>
+      <p class="notice">あなたの世界を共有しよう。気になる投稿を見つけて、新しいつながりを作ろう。</p>
+    </div>
+    <p class="notice">Stax · Share your world</p>
+  </aside>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // Supabase Dashboard → Project Settings → API
+  const SUPABASE_URL = "https://epecjthitwtgmkhdgsyn.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_rqF7CtvvtRqNXxlEO7SQcA_HEtbJD6B";
+
+  const configured =
+    !SUPABASE_URL.includes("YOUR_PROJECT") &&
+    !SUPABASE_KEY.includes("YOUR_SUPABASE");
+
+  const $ = id => document.getElementById(id);
+  let client = null;
+  let registering = false;
+  let currentUser = null;
+  let page = "home";
+  let viewedProfileId = null;
+  let profileSubpanel = null;
+  let profileSubpanelElement = null;
+  let activeConversationId = null;
+
+  if (configured && window.supabase) {
+    client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
   }
 
-  if (request.method !== "POST") return json({ error: "POST only" }, 405);
+  function status(message, target = "authStatus") {
+    $(target).textContent = message;
+  }
 
-  try {
-    const body = await request.json();
-    const action = body?.action;
-    if (typeof action !== "string") {
-      return json({ error: "action is required" }, 400);
+  function escapeHTML(value) {
+    return String(value).replace(/[&<>"']/g, char => ({
+      "&":"&amp;", "<":"&lt;", ">":"&gt;",
+      '"':"&quot;", "'":"&#39;"
+    })[char]);
+  }
+
+  function showApp(user) {
+    currentUser = user;
+    $("auth").classList.add("hidden");
+    $("app").classList.remove("hidden");
+    $("myAvatar").textContent =
+      (user.display_name || user.user_id || "S").slice(0,1).toUpperCase();
+    loadPage();
+  }
+
+  $("switchAuth").addEventListener("click", () => {
+    registering = !registering;
+    $("authTitle").textContent = registering ? "新規登録" : "ログイン";
+    $("authButton").textContent = registering ? "登録する" : "ログイン";
+    $("displayName").classList.toggle("hidden", !registering);
+    $("switchAuth").textContent =
+      registering ? "ログインに戻る" : "アカウントを新規登録";
+    $("password").autocomplete =
+      registering ? "new-password" : "current-password";
+    status("");
+  });
+
+  async function authRequest(action, data) {
+    const response = await fetch(
+      SUPABASE_URL + "/functions/v1/stax-auth",
+      {
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          "apikey":SUPABASE_KEY
+        },
+        body:JSON.stringify({action,...data})
+      }
+    );
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(result.error || result.message || "認証に失敗しました。");
+    }
+    return result;
+  }
+
+  $("authButton").addEventListener("click", async () => {
+    if (!configured || !client) {
+      status("先にSUPABASE_URLとSUPABASE_KEYを設定してください。");
+      return;
     }
 
-    const supabase = db();
-    const auth = await authenticate(request, supabase);
-    if (!auth) return json({ error: "ログインしてください。" }, 401);
+    const user_id = $("userId").value.trim();
+    const password = $("password").value;
+    const display_name = $("displayName").value.trim();
 
-    const me = auth.account;
-    const myId = me.id;
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(user_id)) {
+      status("IDは英数字と_を使った3〜20文字にしてください。");
+      return;
+    }
+    if (password.length < 8) {
+      status("パスワードは8文字以上にしてください。");
+      return;
+    }
+    if (registering && !display_name) {
+      status("表示名を入力してください。");
+      return;
+    }
 
-    // Current account
-    if (action === "me") return json({ user: me });
+    $("authButton").disabled = true;
+    status("処理中…");
 
-    // Update own profile
-    if (action === "update_profile") {
-      const displayName = requiredText(body.display_name, 40);
-      if (!displayName) {
-        return json({ error: "表示名は1〜40文字で入力してください。" }, 400);
+    try {
+      const result = await authRequest(
+        registering ? "register" : "login",
+        {user_id,password,display_name}
+      );
+
+      if (!result.token) {
+        throw new Error("認証APIの応答にtokenがありません。");
       }
 
-      const bio = typeof body.bio === "string" ? body.bio.trim().slice(0, 300) : "";
-      const website = typeof body.website === "string" ? body.website.trim().slice(0, 2048) : "";
-      const avatarUrl = typeof body.avatar_url === "string" ? body.avatar_url.trim().slice(0, 2048) : "";
+      // 本番ではHttpOnly Cookieを使う構成がより安全です。
+      // localStorageへの長期保存はXSSの影響を受ける可能性があります。
+      sessionStorage.setItem("stax_token", result.token);
+      const user = result.user || { user_id, display_name:display_name || user_id };
+      rememberAccount(user, result.token);
+      showApp(user);
+    } catch (error) {
+      status(error.message || "接続に失敗しました。");
+    } finally {
+      $("authButton").disabled = false;
+    }
+  });
 
-      for (const [label, value] of [["ウェブサイト", website], ["プロフィール画像URL", avatarUrl]] as const) {
-        if (value) {
-          try {
-            const parsed = new URL(value);
-            if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("bad protocol");
-          } catch {
-            return json({ error: `${label}にはhttpまたはhttpsのURLを指定してください。` }, 400);
+  function rememberAccount(user, token) {
+    const key = user.user_id || user.id || "unknown";
+    let list = [];
+    try { list = JSON.parse(sessionStorage.getItem("stax_saved_accounts") || "[]"); } catch {}
+    list = list.filter(x => x.key !== key);
+    list.unshift({ key, user_id:user.user_id || key, display_name:user.display_name || user.user_id || key, token });
+    sessionStorage.setItem("stax_saved_accounts", JSON.stringify(list.slice(0, 10)));
+  }
+
+  $("accountSwitch").addEventListener("click", async () => {
+    try {
+      if (currentUser && sessionStorage.getItem("stax_token")) rememberAccount(currentUser, sessionStorage.getItem("stax_token"));
+      let list = [];
+      try { list = JSON.parse(sessionStorage.getItem("stax_saved_accounts") || "[]"); } catch {}
+      const choices = list.map((x,i) => `${i+1}. ${x.display_name} (@${x.user_id})`).join("\n");
+      const choice = prompt("切り替えるアカウントの番号を入力してください。\n\n" + (choices || "保存済みアカウントはありません。") + "\n\n別アカウントにログインする場合はキャンセルしてログアウト後にログインしてください。");
+      if (choice === null) return;
+      const index = Number(choice) - 1;
+      if (!Number.isInteger(index) || index < 0 || index >= list.length) throw new Error("有効な番号を入力してください。");
+      sessionStorage.setItem("stax_token", list[index].token);
+      const result = await api("me");
+      rememberAccount(result.user || result, list[index].token);
+      page = "home"; viewedProfileId = null; activeConversationId = null;
+      showApp(result.user || result);
+    } catch (error) { status(error.message || "アカウントを切り替えられませんでした。", "content"); }
+  });
+
+  async function api(action, data = {}) {
+    const token = sessionStorage.getItem("stax_token");
+    if (!token) throw new Error("ログインしてください。");
+
+    const response = await fetch(
+      SUPABASE_URL + "/functions/v1/stax-api",
+      {
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          "apikey":SUPABASE_KEY,
+          "Authorization":"Bearer " + token
+        },
+        body:JSON.stringify({action,...data})
+      }
+    );
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(result.error || result.message || "APIエラー");
+    }
+    return result;
+  }
+
+  $("postText").addEventListener("input", () => {
+    $("charCount").textContent = $("postText").value.length + " / 2000";
+  });
+
+  $("publish").addEventListener("click", async () => {
+    const text = $("postText").value.trim();
+    if (!text) return status("投稿内容を入力してください。","content");
+
+    $("publish").disabled = true;
+    try {
+      await api("create_post",{text});
+      $("postText").value = "";
+      $("charCount").textContent = "0 / 2000";
+      await loadPage();
+    } catch (error) {
+      status(error.message,"content");
+    } finally {
+      $("publish").disabled = false;
+    }
+  });
+
+  async function loadPage() {
+    $("pageTitle").textContent = ({
+      home:"ホーム",search:"検索", notifications:"通知",messages:"DM",profile:"プロフィール",settings:"設定"
+    })[page] || "Stax";
+    $("composer").classList.toggle("hidden", page !== "home");
+    $("content").innerHTML = '<div class="panel muted">読み込み中…</div>';
+    try {
+      let result;
+      if (page === "profile") result = await api("profile", viewedProfileId ? {user_id:viewedProfileId} : {});
+      else if (page === "settings") result = await api("profile", {});
+      else result = await api(page === "home" ? "timeline" : page,
+        page === "search" ? {query:$("searchInput").value.trim()} : {});
+      renderResult(result);
+    } catch (error) {
+      $("content").innerHTML = '<div class="panel notice">' + escapeHTML(error.message) + '</div>';
+    }
+  }
+
+  function avatarMarkup(user, sizeClass = "") {
+    const label = (user.display_name || user.user_id || "S").slice(0,1).toUpperCase();
+    return user.avatar_url
+      ? '<img class="avatar ' + sizeClass + '" style="object-fit:cover" src="' + escapeHTML(user.avatar_url) + '" alt="" loading="lazy">'
+      : '<div class="avatar ' + sizeClass + '">' + escapeHTML(label) + '</div>';
+  }
+
+  function accountCard(account) {
+    const el = document.createElement("div");
+    el.className = "post";
+    el.innerHTML = '<div class="post-head">' + avatarMarkup(account) +
+      '<div style="flex:1;min-width:0"><strong>' + escapeHTML(account.display_name || account.user_id) +
+      (account.is_private ? ' 🔒' : '') + '</strong><div class="muted">@' + escapeHTML(account.user_id || '') + '</div>' +
+      (account.bio ? '<div class="post-text">' + escapeHTML(account.bio) + '</div>' : '') + '</div>' +
+      '<button class="btn secondary" data-view>プロフィール</button></div>' +
+      '<div class="actions"><button class="btn" data-follow>' +
+      (account.following_by_me ? 'フォロー中' : account.requested_by_me ? '申請中' : 'フォロー') +
+      '</button></div>';
+    el.querySelector('[data-view]').addEventListener('click', () => {
+      viewedProfileId = account.user_id;
+      page = "profile";
+      document.querySelectorAll("[data-page]").forEach(item => item.classList.toggle("active", item.dataset.page === "profile"));
+      loadPage();
+    });
+    el.querySelector('[data-follow]').addEventListener('click', async () => {
+      try {
+        const r = await api("follow", {account_id:account.id});
+        status(r.requested ? "フォロー申請を送信しました。" : r.canceled_request ? "フォロー申請を取り消しました。" : r.following ? "フォローしました。" : "フォローを解除しました。", "content");
+        await loadPage();
+      } catch (error) { status(error.message, "content"); }
+    });
+    return el;
+  }
+
+  function postCard(post) {
+    const article = document.createElement("article");
+    article.className = "post";
+    const author = post.display_name || post.user_id || "ユーザー";
+    article.innerHTML = '<div class="post-head">' + avatarMarkup(post) +
+      '<div style="min-width:0"><strong>' + escapeHTML(author) + '</strong>' +
+      '<div class="muted">@' + escapeHTML(post.user_id || "") + '</div></div>' +
+      '<button class="action" data-author-profile>プロフィール</button></div>' +
+      '<div class="post-text">' + escapeHTML(post.text || post.content || "") + '</div>' +
+      '<div class="actions"><button class="action" data-action="reply">返信</button>' +
+      '<button class="action" data-action="repost">' + (post.reposted_by_me ? 'リポスト済み' : 'リポスト') + '</button>' +
+      '<button class="action" data-action="like">' + (post.liked_by_me ? '♥ いいね済み' : '♡ いいね') + '</button></div>';
+    article.querySelector('[data-author-profile]').addEventListener('click', () => {
+      if (!post.user_id) return;
+      viewedProfileId = post.user_id; page = "profile";
+      document.querySelectorAll("[data-page]").forEach(item => item.classList.toggle("active", item.dataset.page === "profile"));
+      loadPage();
+    });
+    article.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
+      const action = button.dataset.action, postId = post.id || post.post_id;
+      if (!postId) return;
+      try {
+        if (action === "reply") {
+          const text = prompt("返信内容を入力してください");
+          if (text && text.trim()) { await api("reply", {post_id:postId,text:text.trim()}); status("返信しました。", "content"); }
+        } else {
+          await api(action === "like" ? "like" : "repost", {post_id:postId});
+          await loadPage();
+        }
+      } catch (error) { status(error.message, "content"); }
+    }));
+    return article;
+  }
+
+  function toggleProfileSubpanel(key, element) {
+    if (profileSubpanelElement && profileSubpanelElement.parentNode) profileSubpanelElement.remove();
+    if (profileSubpanel === key) {
+      profileSubpanel = null;
+      profileSubpanelElement = null;
+      return false;
+    }
+    profileSubpanel = key;
+    profileSubpanelElement = element;
+    const root = $("content");
+    const profilePanel = root.querySelector('.profile-main-panel');
+    if (profilePanel) profilePanel.after(element);
+    else root.appendChild(element);
+    return true;
+  }
+
+  async function renderSettings(result) {
+    const root = $("content"); root.replaceChildren();
+    const user = result.user || {};
+    const panel = document.createElement('div'); panel.className = 'panel';
+    panel.innerHTML = '<h2 style="margin-top:0">設定</h2>' +
+      '<p class="muted">プロフィールと公開範囲を変更できます。</p>' +
+      '<label>表示名<input id="settingsDisplayName" maxlength="40"></label>' +
+      '<label style="display:block;margin-top:12px">自己紹介<textarea id="settingsBio" maxlength="300" style="min-height:80px"></textarea></label>' +
+      '<label style="display:block;margin-top:12px">ウェブサイト<input id="settingsWebsite" type="url" placeholder="https://example.com"></label>' +
+      '<div style="margin-top:14px"><strong>プロフィール画像</strong><input id="settingsAvatar" type="file" accept="image/png,image/jpeg,image/webp,image/gif" style="margin-top:8px"><p class="muted">PNG / JPEG / WebP / GIF、2MB以下</p></div>' +
+      '<label class="row" style="margin:16px 0;align-items:flex-start"><input id="settingsPrivate" type="checkbox" style="width:auto;margin-top:4px"><span><strong>鍵アカウントにする</strong><br><span class="muted">オンにすると、承認したフォロワーだけが投稿を見られます。新しいフォローは申請制になります。</span></span></label>' +
+      '<button class="btn" id="saveSettings">設定を保存</button><div id="settingsStatus" class="muted" style="margin-top:10px"></div>';
+    root.appendChild(panel);
+    panel.querySelector('#settingsDisplayName').value = user.display_name || '';
+    panel.querySelector('#settingsBio').value = user.bio || '';
+    panel.querySelector('#settingsWebsite').value = user.website || '';
+    panel.querySelector('#settingsPrivate').checked = Boolean(user.is_private);
+    panel.querySelector('#saveSettings').addEventListener('click', async () => {
+      const button = panel.querySelector('#saveSettings');
+      const message = panel.querySelector('#settingsStatus');
+      button.disabled = true; message.textContent = '保存中…';
+      try {
+        const file = panel.querySelector('#settingsAvatar').files[0];
+        if (file) {
+          if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) throw new Error('PNG/JPEG/WebP/GIF画像を選択してください。');
+          if (file.size > 2 * 1024 * 1024) throw new Error('画像は2MB以下にしてください。');
+          const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error('画像を読み込めませんでした。')); reader.readAsDataURL(file);
+          });
+          const uploaded = await api('upload_avatar', {data_url:dataUrl});
+          if (uploaded.user) currentUser = uploaded.user;
+        }
+        const saved = await api('update_profile', {
+          display_name:panel.querySelector('#settingsDisplayName').value.trim(),
+          bio:panel.querySelector('#settingsBio').value,
+          website:panel.querySelector('#settingsWebsite').value.trim(),
+          is_private:panel.querySelector('#settingsPrivate').checked
+        });
+        currentUser = saved.user || currentUser;
+        rememberAccount(currentUser, sessionStorage.getItem('stax_token'));
+        const myAvatarEl = $("myAvatar");
+        myAvatarEl.replaceChildren();
+        if (currentUser.avatar_url) {
+          const img = document.createElement('img'); img.src = currentUser.avatar_url; img.alt = '';
+          img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:50%'; myAvatarEl.appendChild(img);
+        } else {
+          myAvatarEl.textContent = (currentUser.display_name || currentUser.user_id || 'S').slice(0,1).toUpperCase();
+        }
+        message.textContent = '設定を保存しました。';
+      } catch (error) { message.textContent = error.message || '保存できませんでした。'; }
+      finally { button.disabled = false; }
+    });
+  }
+
+  async function renderProfile(result) {
+    const root = $("content"); root.replaceChildren();
+    profileSubpanel = null; profileSubpanelElement = null;
+    const user = result.user;
+    const panel = document.createElement("div"); panel.className = "panel profile-main-panel";
+    panel.innerHTML = '<div class="row">' + avatarMarkup(user) + '<div style="flex:1"><h2 style="margin:0">' +
+      escapeHTML(user.display_name || user.user_id) + (user.is_private ? ' 🔒 鍵アカウント' : '') +
+      '</h2><div class="muted">@' + escapeHTML(user.user_id) + '</div></div></div>' +
+      (user.bio ? '<p>' + escapeHTML(user.bio) + '</p>' : '') +
+      (user.website ? '<p><a href="' + escapeHTML(user.website) + '" target="_blank" rel="noopener noreferrer">' + escapeHTML(user.website) + '</a></p>' : '') +
+      '<div class="row" style="margin:12px 0;flex-wrap:wrap"><button class="action" data-list="followers"><strong>' +
+      Number(result.followers_count || 0) + '</strong> フォロワー</button><button class="action" data-list="following"><strong>' +
+      Number(result.following_count || 0) + '</strong> フォロー中</button></div>';
+    if (!result.is_me) {
+      panel.innerHTML += '<div class="row" style="flex-wrap:wrap"><button class="btn" id="profileFollow">' +
+        (result.following_by_me ? 'フォロー中（解除）' : result.requested_by_me ? '申請中（取り消しは再操作）' : 'フォロー') +
+        '</button>' + (result.followed_by_me && result.following_by_me ? '<button class="btn secondary" id="profileDM">DMを送る</button>' : '') + '</div>';
+    } else {
+      panel.innerHTML += '<div class="row" style="flex-wrap:wrap"><button class="btn secondary" id="showFollowRequests">フォロー申請を確認</button></div>';
+    }
+    root.appendChild(panel);
+    panel.querySelectorAll('[data-list]').forEach(button => button.addEventListener('click', async () => {
+      const key = 'list-' + button.dataset.list;
+      if (profileSubpanel === key) { toggleProfileSubpanel(key, document.createElement('div')); return; }
+      try {
+        const r = await api('follow_list', {account_id:user.id,kind:button.dataset.list});
+        const list = document.createElement('div'); list.className='panel';
+        list.innerHTML='<strong>' + (button.dataset.list === 'followers' ? 'フォロワー' : 'フォロー中') + '</strong>';
+        if (!r.accounts.length) list.innerHTML += '<p class="muted">まだユーザーがいません。</p>';
+        r.accounts.forEach(a => list.appendChild(accountCard(a)));
+        toggleProfileSubpanel(key, list);
+      } catch(error) { status(error.message, 'content'); }
+    }));
+    if (!result.is_me) {
+      const follow = panel.querySelector('#profileFollow');
+      if (follow) follow.addEventListener('click', async () => {
+        try { const r=await api('follow',{account_id:user.id}); status(r.requested?'フォロー申請を送信しました。':r.canceled_request?'フォロー申請を取り消しました。':r.following?'フォローしました。':'フォローを解除しました。','content'); await loadPage(); }
+        catch(error) { status(error.message,'content'); }
+      });
+      const dm = panel.querySelector('#profileDM');
+      if (dm) dm.addEventListener('click', async () => {
+        try { const created = await api('create_dm',{account_id:user.id}); activeConversationId = created.conversation && created.conversation.id; page='messages'; await loadPage(); }
+        catch(error) { status(error.message,'content'); }
+      });
+    } else {
+      panel.querySelector('#showFollowRequests').addEventListener('click', async () => {
+        const key = 'requests';
+        if (profileSubpanel === key) { toggleProfileSubpanel(key, document.createElement('div')); return; }
+        try {
+          const r = await api('follow_requests');
+          const box = document.createElement('div'); box.className='panel'; box.innerHTML='<strong>フォロー申請</strong>';
+          if (!r.requests.length) box.innerHTML += '<p class="muted">申請はありません。</p>';
+          for (const req of r.requests) {
+            const row=document.createElement('div'); row.className='post';
+            row.innerHTML='<strong>' + escapeHTML(req.requester.display_name || req.requester.user_id) + '</strong> <span class="muted">@' + escapeHTML(req.requester.user_id) + '</span> <button class="btn" data-accept>承認</button> <button class="btn secondary" data-reject>拒否</button>';
+            row.querySelector('[data-accept]').addEventListener('click', async()=>{ try { await api('accept_follow_request',{request_id:req.id}); profileSubpanel=null; profileSubpanelElement=null; await loadPage(); } catch(e){status(e.message,'content');} });
+            row.querySelector('[data-reject]').addEventListener('click', async()=>{ try { await api('reject_follow_request',{request_id:req.id}); profileSubpanel=null; profileSubpanelElement=null; await loadPage(); } catch(e){status(e.message,'content');} });
+            box.appendChild(row);
           }
-        }
-      }
-
-      const { data: user, error } = await supabase
-        .from("stax_accounts")
-        .update({
-          display_name: displayName,
-          bio,
-          website: website || null,
-          avatar_url: avatarUrl || null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", myId)
-        .select("id,user_id,display_name,bio,website,avatar_url,is_private,is_banned,is_admin,updated_at")
-        .single();
-
-      if (error) throw error;
-      return json({ user });
+          toggleProfileSubpanel(key, box);
+        } catch(error) { status(error.message,'content'); }
+      });;
     }
-
-    // Own profile and posts
-    if (action === "profile") {
-      const { data: user, error: userError } = await supabase
-        .from("stax_accounts")
-        .select("id,user_id,display_name,bio,website,avatar_url,is_private,created_at")
-        .eq("id", myId)
-        .single();
-      if (userError) throw userError;
-
-      const { data: posts, error: postsError } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
-        .eq("author_id", myId)
-        .eq("is_deleted", false)
-        .order("is_pinned", { ascending: false })
-        .order("created_at", { ascending: false })
-        .limit(100);
-      if (postsError) throw postsError;
-
-      const resultPosts = [];
-      for (const post of posts || []) {
-        const { count: likes, error: likesError } = await supabase
-          .from("stax_likes")
-          .select("post_id", { count: "exact", head: true })
-          .eq("post_id", post.id);
-        if (likesError) throw likesError;
-
-        const { data: liked, error: likedError } = await supabase
-          .from("stax_likes")
-          .select("post_id")
-          .eq("post_id", post.id)
-          .eq("account_id", myId)
-          .maybeSingle();
-        if (likedError) throw likedError;
-
-        const { data: repost, error: repostError } = await supabase
-          .from("stax_posts")
-          .select("id")
-          .eq("author_id", myId)
-          .eq("repost_of_id", post.id)
-          .eq("is_deleted", false)
-          .maybeSingle();
-        if (repostError) throw repostError;
-
-        resultPosts.push({
-          ...post,
-          user_id: user.user_id,
-          display_name: user.display_name,
-          avatar_url: user.avatar_url,
-          like_count: likes || 0,
-          liked_by_me: Boolean(liked),
-          reposted_by_me: Boolean(repost),
-        });
-      }
-      return json({ user, posts: resultPosts });
+    if (result.private_locked) {
+      const locked=document.createElement('div'); locked.className='panel muted'; locked.textContent='このアカウントは鍵アカウントです。フォローが承認されると投稿を見られます。'; root.appendChild(locked); return;
     }
-
-    // Delete own post or reply (soft-delete)
-    if (action === "delete_post") {
-      const postId = body.post_id;
-      if (typeof postId !== "string") return json({ error: "post_id is required" }, 400);
-
-      const { data: post, error: postError } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,is_deleted")
-        .eq("id", postId)
-        .maybeSingle();
-      if (postError) throw postError;
-      if (!post || post.is_deleted) return json({ error: "投稿が見つかりません。" }, 404);
-      if (post.author_id !== myId) return json({ error: "自分の投稿だけ削除できます。" }, 403);
-
-      const { error } = await supabase
-        .from("stax_posts")
-        .update({ is_deleted: true, updated_at: new Date().toISOString() })
-        .eq("id", postId)
-        .eq("author_id", myId);
-      if (error) throw error;
-      return json({ success: true, deleted: true });
-    }
-
-    // Pin/unpin one of own posts
-    if (action === "pin_post") {
-      const postId = body.post_id;
-      const pinned = body.pinned === true;
-      if (typeof postId !== "string") return json({ error: "post_id is required" }, 400);
-
-      const { data: post, error: postError } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,is_deleted")
-        .eq("id", postId)
-        .maybeSingle();
-      if (postError) throw postError;
-      if (!post || post.is_deleted) return json({ error: "投稿が見つかりません。" }, 404);
-      if (post.author_id !== myId) return json({ error: "自分の投稿だけピン留めできます。" }, 403);
-
-      if (pinned) {
-        const { error: unpinError } = await supabase
-          .from("stax_posts")
-          .update({ is_pinned: false })
-          .eq("author_id", myId)
-          .eq("is_pinned", true);
-        if (unpinError) throw unpinError;
-      }
-
-      const { error } = await supabase
-        .from("stax_posts")
-        .update({ is_pinned: pinned, updated_at: new Date().toISOString() })
-        .eq("id", postId)
-        .eq("author_id", myId);
-      if (error) throw error;
-      return json({ success: true, pinned });
-    }
-
-    // Create post / reply / quote
-    if (action === "create_post" || action === "reply") {
-      const content = requiredText(body.text, 2000);
-      if (!content) return json({ error: "投稿内容を入力してください。" }, 400);
-
-      const replyTo = action === "reply" ? body.post_id : body.reply_to_id;
-      const quoteId = body.quote_post_id;
-
-      if (replyTo || quoteId) {
-        const targetId = replyTo || quoteId;
-        const { data: target, error: targetError } = await supabase
-          .from("stax_posts")
-          .select("id,author_id,visibility,is_deleted")
-          .eq("id", targetId)
-          .eq("is_deleted", false)
-          .maybeSingle();
-
-        if (targetError) throw targetError;
-        if (!target) return json({ error: "対象の投稿がありません。" }, 404);
-        if (await blockedEitherWay(supabase, myId, target.author_id)) {
-          return json({ error: "この投稿には操作できません。" }, 403);
-        }
-        if (target.visibility !== "public" &&
-            target.author_id !== myId &&
-            !(await isFollowing(supabase, myId, target.author_id))) {
-          return json({ error: "この投稿は閲覧できません。" }, 403);
-        }
-      }
-
-      const { data: post, error } = await supabase
-        .from("stax_posts")
-        .insert({
-          author_id: myId,
-          content,
-          reply_to_id: replyTo || null,
-          quote_post_id: quoteId || null,
-          visibility: "public",
-        })
-        .select("*")
-        .single();
-
-      if (error) throw error;
-
-      // Extract and attach hashtags.
-      const tags = [...new Set(
-        [...content.matchAll(/#([\p{L}\p{N}_]{1,50})/gu)]
-          .map((match) => match[1].toLowerCase())
-      )].slice(0, 20);
-
-      for (const tag of tags) {
-        const { data: hashtag, error: tagError } = await supabase
-          .from("stax_hashtags")
-          .upsert({ tag }, { onConflict: "tag" })
-          .select("id")
-          .single();
-
-        if (tagError) throw tagError;
-
-        const { error: linkError } = await supabase
-          .from("stax_post_hashtags")
-          .upsert(
-            { post_id: post.id, hashtag_id: hashtag.id },
-            { onConflict: "post_id,hashtag_id" },
-          );
-
-        if (linkError) throw linkError;
-      }
-
-      if (replyTo || quoteId) {
-        const targetId = replyTo || quoteId;
-        const { data: target } = await supabase
-          .from("stax_posts")
-          .select("author_id")
-          .eq("id", targetId)
-          .maybeSingle();
-
-        if (target) {
-          await notify(
-            supabase,
-            target.author_id,
-            myId,
-            replyTo ? "reply" : "mention",
-            post.id,
-          );
-        }
-      }
-
-      return json({ post }, 201);
-    }
-
-    // Timeline
-    if (action === "timeline") {
-      const { data: follows, error: followError } = await supabase
-        .from("stax_follows")
-        .select("following_id")
-        .eq("follower_id", myId);
-
-      if (followError) throw followError;
-
-      const authorIds = [
-        myId,
-        ...(follows || []).map((row) => row.following_id),
-      ];
-
-      const { data: posts, error } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
-        .eq("is_deleted", false)
-        .in("author_id", authorIds)
-        .order("created_at", { ascending: false })
-        .limit(50);
-
-      if (error) throw error;
-
-      const visible = [];
-      for (const post of posts || []) {
-        if (await blockedEitherWay(supabase, myId, post.author_id)) continue;
-
-        const { data: author } = await supabase
-          .from("stax_accounts")
-          .select("user_id,display_name,avatar_url,is_private")
-          .eq("id", post.author_id)
-          .maybeSingle();
-
-        if (!author) continue;
-        if (author.is_private && post.author_id !== myId &&
-            !(await isFollowing(supabase, myId, post.author_id))) continue;
-        if (post.visibility === "private" && post.author_id !== myId) continue;
-        if (post.visibility === "followers" && post.author_id !== myId &&
-            !(await isFollowing(supabase, myId, post.author_id))) continue;
-
-        const { count: likes } = await supabase
-          .from("stax_likes")
-          .select("*", { count: "exact", head: true })
-          .eq("post_id", post.id);
-
-        const { data: liked } = await supabase
-          .from("stax_likes")
-          .select("post_id")
-          .eq("post_id", post.id)
-          .eq("account_id", myId)
-          .maybeSingle();
-
-        const { data: myRepost, error: repostError } = await supabase
-          .from("stax_posts")
-          .select("id")
-          .eq("author_id", myId)
-          .eq("repost_of_id", post.id)
-          .eq("is_deleted", false)
-          .maybeSingle();
-        if (repostError) throw repostError;
-
-        visible.push({
-          ...post,
-          user_id: author.user_id,
-          display_name: author.display_name,
-          avatar_url: author.avatar_url,
-          like_count: likes || 0,
-          liked_by_me: Boolean(liked),
-          reposted_by_me: Boolean(myRepost),
-        });
-      }
-
-      return json({ posts: visible });
-    }
-
-    // Like / unlike
-    if (action === "like") {
-      const postId = body.post_id;
-      if (typeof postId !== "string") {
-        return json({ error: "post_id is required" }, 400);
-      }
-
-      const { data: post, error: postError } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,visibility,is_deleted")
-        .eq("id", postId)
-        .eq("is_deleted", false)
-        .maybeSingle();
-
-      if (postError) throw postError;
-      if (!post) return json({ error: "投稿がありません。" }, 404);
-      if (await blockedEitherWay(supabase, myId, post.author_id)) {
-        return json({ error: "この投稿には操作できません。" }, 403);
-      }
-
-      const { data: existing, error: existingError } = await supabase
-        .from("stax_likes")
-        .select("post_id")
-        .eq("post_id", postId)
-        .eq("account_id", myId)
-        .maybeSingle();
-
-      if (existingError) throw existingError;
-
-      if (existing) {
-        const { error } = await supabase
-          .from("stax_likes")
-          .delete()
-          .eq("post_id", postId)
-          .eq("account_id", myId);
-        if (error) throw error;
-        return json({ liked: false });
-      }
-
-      const { error } = await supabase.from("stax_likes").insert({
-        post_id: postId,
-        account_id: myId,
-      });
-      if (error) throw error;
-
-      await notify(supabase, post.author_id, myId, "like", postId);
-      return json({ liked: true });
-    }
-
-    // Repost / unrepost
-    if (action === "repost") {
-      const postId = body.post_id;
-      if (typeof postId !== "string") {
-        return json({ error: "post_id is required" }, 400);
-      }
-
-      const { data: target, error: targetError } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,is_deleted")
-        .eq("id", postId)
-        .eq("is_deleted", false)
-        .maybeSingle();
-
-      if (targetError) throw targetError;
-      if (!target) return json({ error: "投稿がありません。" }, 404);
-      if (await blockedEitherWay(supabase, myId, target.author_id)) {
-        return json({ error: "この投稿には操作できません。" }, 403);
-      }
-
-      const { data: existing, error: lookupError } = await supabase
-        .from("stax_posts")
-        .select("id")
-        .eq("author_id", myId)
-        .eq("repost_of_id", postId)
-        .eq("is_deleted", false)
-        .maybeSingle();
-
-      if (lookupError) throw lookupError;
-
-      if (existing) {
-        const { error } = await supabase
-          .from("stax_posts")
-          .update({ is_deleted: true })
-          .eq("id", existing.id)
-          .eq("author_id", myId);
-        if (error) throw error;
-        return json({ reposted: false });
-      }
-
-      const { data: repost, error } = await supabase
-        .from("stax_posts")
-        .insert({
-          author_id: myId,
-          content: "",
-          repost_of_id: postId,
-          visibility: "public",
-        })
-        .select("*")
-        .single();
-
-      if (error) throw error;
-      await notify(supabase, target.author_id, myId, "repost", postId);
-      return json({ reposted: true, post: repost }, 201);
-    }
-
-    // Follow / unfollow
-    if (action === "follow") {
-      const targetId = body.account_id;
-      if (typeof targetId !== "string" || targetId === myId) {
-        return json({ error: "account_id is invalid" }, 400);
-      }
-
-      if (await blockedEitherWay(supabase, myId, targetId)) {
-        return json({ error: "このユーザーには操作できません。" }, 403);
-      }
-
-      const { data: target, error: targetError } = await supabase
-        .from("stax_accounts")
-        .select("id,is_private,is_banned")
-        .eq("id", targetId)
-        .maybeSingle();
-
-      if (targetError) throw targetError;
-      if (!target || target.is_banned) {
-        return json({ error: "ユーザーが見つかりません。" }, 404);
-      }
-
-      const following = await isFollowing(supabase, myId, targetId);
-
-      if (following) {
-        const { error } = await supabase
-          .from("stax_follows")
-          .delete()
-          .eq("follower_id", myId)
-          .eq("following_id", targetId);
-        if (error) throw error;
-        return json({ following: false });
-      }
-
-      if (target.is_private) {
-        const { error } = await supabase.from("stax_follow_requests").upsert({
-          requester_id: myId,
-          target_id: targetId,
-          status: "pending",
-        }, { onConflict: "requester_id,target_id" });
-        if (error) throw error;
-        await notify(supabase, targetId, myId, "follow_request");
-        return json({ requested: true });
-      }
-
-      const { error } = await supabase.from("stax_follows").insert({
-        follower_id: myId,
-        following_id: targetId,
-      });
-      if (error) throw error;
-
-      await notify(supabase, targetId, myId, "follow");
-      return json({ following: true });
-    }
-
-    // Search accounts / posts / hashtags
-    if (action === "search") {
-      const query = requiredText(body.query, 100);
-      if (!query) return json({ accounts: [], posts: [], hashtags: [] });
-
-      const safeQuery = query.replace(/[%_\\]/g, "\\$&");
-      const { data: accounts, error: accountError } = await supabase
-        .from("stax_accounts")
-        .select("id,user_id,display_name,avatar_url,bio,is_private")
-        .ilike("user_id", `%${safeQuery}%`)
-        .eq("is_banned", false)
-        .limit(20);
-
-      if (accountError) throw accountError;
-
-      const { data: posts, error: postError } = await supabase
-        .from("stax_posts")
-        .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
-        .eq("is_deleted", false)
-        .ilike("content", `%${safeQuery}%`)
-        .order("created_at", { ascending: false })
-        .limit(30);
-
-      if (postError) throw postError;
-
-      const visiblePosts = [];
-      for (const post of posts || []) {
-        if (await blockedEitherWay(supabase, myId, post.author_id)) continue;
-
-        const { data: author } = await supabase
-          .from("stax_accounts")
-          .select("user_id,display_name,is_private")
-          .eq("id", post.author_id)
-          .maybeSingle();
-
-        if (!author) continue;
-        if (author.is_private && post.author_id !== myId &&
-            !(await isFollowing(supabase, myId, post.author_id))) continue;
-
-        const { count: likeCount, error: likeCountError } = await supabase
-          .from("stax_likes")
-          .select("post_id", { count: "exact", head: true })
-          .eq("post_id", post.id);
-        if (likeCountError) throw likeCountError;
-
-        const { data: liked, error: likedError } = await supabase
-          .from("stax_likes")
-          .select("post_id")
-          .eq("post_id", post.id)
-          .eq("account_id", myId)
-          .maybeSingle();
-        if (likedError) throw likedError;
-
-        const { data: myRepost, error: repostError } = await supabase
-          .from("stax_posts")
-          .select("id")
-          .eq("author_id", myId)
-          .eq("repost_of_id", post.id)
-          .eq("is_deleted", false)
-          .maybeSingle();
-        if (repostError) throw repostError;
-
-        visiblePosts.push({
-          ...post,
-          user_id: author.user_id,
-          display_name: author.display_name,
-          like_count: likeCount || 0,
-          liked_by_me: Boolean(liked),
-          reposted_by_me: Boolean(myRepost),
-        });
-      }
-
-      const tag = query.replace(/^#/, "").toLowerCase();
-      const { data: hashtags, error: tagError } = await supabase
-        .from("stax_hashtags")
-        .select("id,tag")
-        .ilike("tag", `%${safeQuery.replace(/^#/, "")}%`)
-        .limit(20);
-
-      if (tagError) throw tagError;
-
-      return json({
-        accounts: (accounts || []).filter(
-          (a) => a.id === myId || !a.is_private
-        ),
-        posts: visiblePosts,
-        hashtags: hashtags || [],
-      });
-    }
-
-    // Notifications
-    if (action === "notifications") {
-      const { data, error } = await supabase
-        .from("stax_notifications")
-        .select("id,actor_id,notification_type,post_id,is_read,created_at")
-        .eq("recipient_id", myId)
-        .order("created_at", { ascending: false })
-        .limit(100);
-
-      if (error) throw error;
-
-      const notifications = [];
-      for (const item of data || []) {
-        if (item.actor_id && await blockedEitherWay(supabase, myId, item.actor_id)) {
-          continue;
-        }
-        notifications.push(item);
-      }
-
-      return json({ notifications });
-    }
-
-    if (action === "read_notifications") {
-      const { error } = await supabase
-        .from("stax_notifications")
-        .update({ is_read: true })
-        .eq("recipient_id", myId)
-        .eq("is_read", false);
-
-      if (error) throw error;
-      return json({ success: true });
-    }
-
-    // Direct-message conversations list
-    if (action === "messages" || action === "conversations") {
-      const { data: memberships, error: memberError } = await supabase
-        .from("stax_conversation_members")
-        .select("conversation_id,last_read_at,is_muted")
-        .eq("account_id", myId);
-
-      if (memberError) throw memberError;
-
-      const conversations = [];
-      for (const member of memberships || []) {
-        const { data: conversation, error } = await supabase
-          .from("stax_conversations")
-          .select("id,conversation_type,title,owner_id,created_at,updated_at")
-          .eq("id", member.conversation_id)
-          .maybeSingle();
-
-        if (error) throw error;
-        if (!conversation) continue;
-
-        const { data: members } = await supabase
-          .from("stax_conversation_members")
-          .select("account_id")
-          .eq("conversation_id", conversation.id);
-
-        const memberIds = (members || []).map((m) => m.account_id);
-        if (memberIds.some((id) => id !== myId &&
-            blockedEitherWay(supabase, myId, id))) continue;
-
-        conversations.push({
-          ...conversation,
-          last_read_at: member.last_read_at,
-          is_muted: member.is_muted,
-        });
-      }
-
-      return json({ conversations });
-    }
-
-    // Create direct conversation
-    if (action === "create_dm") {
-      const targetId = body.account_id;
-      if (typeof targetId !== "string" || targetId === myId) {
-        return json({ error: "account_id is invalid" }, 400);
-      }
-
-      if (await blockedEitherWay(supabase, myId, targetId)) {
-        return json({ error: "このユーザーにはDMを送れません。" }, 403);
-      }
-
-      const { data: target, error: targetError } = await supabase
-        .from("stax_accounts")
-        .select("id,is_private,is_banned")
-        .eq("id", targetId)
-        .maybeSingle();
-
-      if (targetError) throw targetError;
-      if (!target || target.is_banned) {
-        return json({ error: "ユーザーが見つかりません。" }, 404);
-      }
-
-      const { data: existingMemberships, error: membershipError } =
-        await supabase
-          .from("stax_conversation_members")
-          .select("conversation_id")
-          .eq("account_id", myId);
-
-      if (membershipError) throw membershipError;
-
-      for (const member of existingMemberships || []) {
-        const { data: conversation } = await supabase
-          .from("stax_conversations")
-          .select("id,conversation_type")
-          .eq("id", member.conversation_id)
-          .eq("conversation_type", "direct")
-          .maybeSingle();
-
-        if (!conversation) continue;
-
-        const { data: otherMembers } = await supabase
-          .from("stax_conversation_members")
-          .select("account_id")
-          .eq("conversation_id", conversation.id);
-
-        const ids = (otherMembers || []).map((m) => m.account_id).sort();
-        if (ids.length === 2 && ids.includes(targetId) && ids.includes(myId)) {
-          return json({ conversation });
-        }
-      }
-
-      const { data: conversation, error: createError } = await supabase
-        .from("stax_conversations")
-        .insert({ conversation_type: "direct", owner_id: myId })
-        .select("*")
-        .single();
-
-      if (createError) throw createError;
-
-      const { error: addMembersError } = await supabase
-        .from("stax_conversation_members")
-        .insert([
-          { conversation_id: conversation.id, account_id: myId },
-          { conversation_id: conversation.id, account_id: targetId },
-        ]);
-
-      if (addMembersError) throw addMembersError;
-      return json({ conversation }, 201);
-    }
-
-    // Create group
-    if (action === "create_group") {
-      const title = requiredText(body.title, 80);
-      const rawMembers = Array.isArray(body.member_ids) ? body.member_ids : [];
-      const memberIds = [...new Set([myId, ...rawMembers])]
-        .filter((id) => typeof id === "string")
-        .slice(0, 51);
-
-      if (!title) return json({ error: "グループ名を入力してください。" }, 400);
-      if (memberIds.length < 2) {
-        return json({ error: "自分以外のメンバーを指定してください。" }, 400);
-      }
-
-      for (const memberId of memberIds) {
-        if (memberId !== myId &&
-            await blockedEitherWay(supabase, myId, memberId)) {
-          return json({ error: "追加できないメンバーが含まれています。" }, 403);
-        }
-      }
-
-      const { data: conversation, error } = await supabase
-        .from("stax_conversations")
-        .insert({
-          conversation_type: "group",
-          title,
-          owner_id: myId,
-        })
-        .select("*")
-        .single();
-
-      if (error) throw error;
-
-      const { error: membersError } = await supabase
-        .from("stax_conversation_members")
-        .insert(memberIds.map((account_id) => ({
-          conversation_id: conversation.id,
-          account_id,
-        })));
-
-      if (membersError) throw membersError;
-      return json({ conversation }, 201);
-    }
-
-    // Read messages in a conversation
-    if (action === "get_messages") {
-      const conversationId = body.conversation_id;
-      if (typeof conversationId !== "string") {
-        return json({ error: "conversation_id is required" }, 400);
-      }
-
-      if (!await isConversationMember(supabase, conversationId, myId)) {
-        return json({ error: "この会話にはアクセスできません。" }, 403);
-      }
-
-      const { data: members } = await supabase
-        .from("stax_conversation_members")
-        .select("account_id")
-        .eq("conversation_id", conversationId);
-
-      for (const member of members || []) {
-        if (member.account_id !== myId &&
-            await blockedEitherWay(supabase, myId, member.account_id)) {
-          return json({ error: "この会話は利用できません。" }, 403);
-        }
-      }
-
-      const { data: messages, error } = await supabase
-        .from("stax_messages")
-        .select("id,conversation_id,sender_id,content,attachment_url,created_at")
-        .eq("conversation_id", conversationId)
-        .eq("is_deleted", false)
-        .order("created_at", { ascending: true })
-        .limit(200);
-
-      if (error) throw error;
-
-      const { error: readError } = await supabase
-        .from("stax_conversation_members")
-        .update({ last_read_at: new Date().toISOString() })
-        .eq("conversation_id", conversationId)
-        .eq("account_id", myId);
-
-      if (readError) throw readError;
-      return json({ messages: messages || [] });
-    }
-
-    // Send message
-    if (action === "send_message") {
-      const conversationId = body.conversation_id;
-      const content = requiredText(body.text, 10000);
-      const attachmentUrl = requiredText(body.attachment_url, 2048);
-
-      if (typeof conversationId !== "string" || (!content && !attachmentUrl)) {
-        return json({ error: "会話とメッセージ内容を指定してください。" }, 400);
-      }
-
-      if (!await isConversationMember(supabase, conversationId, myId)) {
-        return json({ error: "この会話にはアクセスできません。" }, 403);
-      }
-
-      const { data: members } = await supabase
-        .from("stax_conversation_members")
-        .select("account_id")
-        .eq("conversation_id", conversationId);
-
-      for (const member of members || []) {
-        if (member.account_id !== myId &&
-            await blockedEitherWay(supabase, myId, member.account_id)) {
-          return json({ error: "この会話は利用できません。" }, 403);
-        }
-      }
-
-      const { data: message, error } = await supabase
-        .from("stax_messages")
-        .insert({
-          conversation_id: conversationId,
-          sender_id: myId,
-          content: content || "",
-          attachment_url: attachmentUrl || null,
-        })
-        .select("*")
-        .single();
-
-      if (error) throw error;
-
-      for (const member of members || []) {
-        if (member.account_id !== myId) {
-          await notify(supabase, member.account_id, myId, "message");
-        }
-      }
-
-      await supabase
-        .from("stax_conversations")
-        .update({ updated_at: new Date().toISOString() })
-        .eq("id", conversationId);
-
-      return json({ message }, 201);
-    }
-
-    // Block
-    if (action === "block") {
-      const targetId = body.account_id;
-      if (typeof targetId !== "string" || targetId === myId) {
-        return json({ error: "account_id is invalid" }, 400);
-      }
-
-      const { error } = await supabase.from("stax_blocks").upsert({
-        blocker_id: myId,
-        blocked_id: targetId,
-      }, { onConflict: "blocker_id,blocked_id" });
-
-      if (error) throw error;
-
-      await supabase.from("stax_follows").delete()
-        .eq("follower_id", myId).eq("following_id", targetId);
-      await supabase.from("stax_follows").delete()
-        .eq("follower_id", targetId).eq("following_id", myId);
-
-      return json({ blocked: true });
-    }
-
-    // Unblock
-    if (action === "unblock") {
-      const targetId = body.account_id;
-      if (typeof targetId !== "string") {
-        return json({ error: "account_id is required" }, 400);
-      }
-
-      const { error } = await supabase
-        .from("stax_blocks")
-        .delete()
-        .eq("blocker_id", myId)
-        .eq("blocked_id", targetId);
-
-      if (error) throw error;
-      return json({ blocked: false });
-    }
-
-    // Report account or post
-    if (action === "report") {
-      const reason = requiredText(body.reason, 200);
-      const details = typeof body.details === "string"
-        ? body.details.trim().slice(0, 2000)
-        : "";
-
-      if (!reason) return json({ error: "通報理由を入力してください。" }, 400);
-
-      const accountId = typeof body.account_id === "string"
-        ? body.account_id
-        : null;
-      const postId = typeof body.post_id === "string"
-        ? body.post_id
-        : null;
-
-      if (!accountId && !postId) {
-        return json({ error: "通報対象を指定してください。" }, 400);
-      }
-
-      if (accountId === myId) {
-        return json({ error: "自分自身は通報できません。" }, 400);
-      }
-
-      if (postId) {
-        const { data: post, error } = await supabase
-          .from("stax_posts")
-          .select("id")
-          .eq("id", postId)
-          .maybeSingle();
-
-        if (error) throw error;
-        if (!post) return json({ error: "投稿が見つかりません。" }, 404);
-      }
-
-      const { data: report, error } = await supabase
-        .from("stax_reports")
-        .insert({
-          reporter_id: myId,
-          reported_account_id: accountId,
-          reported_post_id: postId,
-          reason,
-          details,
-        })
-        .select("id,status,created_at")
-        .single();
-
-      if (error) throw error;
-      return json({ report }, 201);
-    }
-
-    // Admin report queue
-    if (action === "admin_reports") {
-      if (!me.is_admin) return json({ error: "管理者権限が必要です。" }, 403);
-
-      const { data, error } = await supabase
-        .from("stax_reports")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(100);
-
-      if (error) throw error;
-      return json({ reports: data || [] });
-    }
-
-    // Admin account ban / unban
-    if (action === "admin_ban") {
-      if (!me.is_admin) return json({ error: "管理者権限が必要です。" }, 403);
-
-      const targetId = body.account_id;
-      const banned = body.banned === true;
-      const reason = typeof body.reason === "string"
-        ? body.reason.trim().slice(0, 500)
-        : "";
-
-      if (typeof targetId !== "string" || targetId === myId) {
-        return json({ error: "対象アカウントが不正です。" }, 400);
-      }
-
-      const { data: target, error: targetError } = await supabase
-        .from("stax_accounts")
-        .select("id")
-        .eq("id", targetId)
-        .maybeSingle();
-
-      if (targetError) throw targetError;
-      if (!target) return json({ error: "ユーザーが見つかりません。" }, 404);
-
-      const { error } = await supabase
-        .from("stax_accounts")
-        .update({
-          is_banned: banned,
-          ban_reason: banned ? reason : null,
-        })
-        .eq("id", targetId);
-
-      if (error) throw error;
-
-      const { error: logError } = await supabase
-        .from("stax_admin_logs")
-        .insert({
-          admin_id: myId,
-          action: banned ? "ban_account" : "unban_account",
-          target_account_id: targetId,
-          details: { reason },
-        });
-
-      if (logError) throw logError;
-
-      if (banned) {
-        const { error: sessionError } = await supabase
-          .from("stax_sessions")
-          .delete()
-          .eq("account_id", targetId);
-        if (sessionError) throw sessionError;
-      }
-
-      return json({ success: true, banned });
-    }
-
-    return json({ error: "Unknown action", action }, 400);
-  } catch (error) {
-    console.error("stax-api error:", error);
-    return json({ error: "サーバー処理に失敗しました。" }, 500);
+    const posts=result.posts || [];
+    if (!posts.length) { const empty=document.createElement('div'); empty.className='panel muted'; empty.textContent='まだ投稿がありません。'; root.appendChild(empty); }
+    posts.forEach(post => root.appendChild(postCard(post)));
   }
-});
+
+  async function renderMessages(result) {
+    const root = $("content"); root.replaceChildren();
+    const conversations = result.conversations || [];
+    const wrap = document.createElement('div'); wrap.className = 'panel';
+    wrap.innerHTML = '<h2 style="margin-top:0">DM</h2>' +
+      '<div class="panel" style="margin:0 0 14px;padding:12px">' +
+      '<strong>DMを送れる相手</strong><p class="muted" style="margin:6px 0 10px">相互フォロー中で、ブロック関係のないユーザーを一覧表示します。</p>' +
+      '<div class="row" style="gap:8px;flex-wrap:wrap"><input id="dmSearchInput" type="search" placeholder="一覧を絞り込み：ID・表示名" style="flex:1;min-width:180px">' +
+      '<button class="btn secondary" id="dmSearchButton">一覧を更新</button></div><div id="dmSearchResults" style="margin-top:10px"><p class="muted">一覧を読み込み中…</p></div></div>' +
+      '<div class="muted" style="margin:8px 0">会話一覧には相手の表示名、メッセージには送信者名が表示されます。</div><div id="dmConversationList"></div><div id="dmThread" style="margin-top:16px"></div>';
+    root.appendChild(wrap);
+    const list = wrap.querySelector('#dmConversationList');
+    const searchInput = wrap.querySelector('#dmSearchInput');
+    const searchButton = wrap.querySelector('#dmSearchButton');
+    const searchResults = wrap.querySelector('#dmSearchResults');
+    let dmCandidates = [];
+    function drawDmCandidates() {
+      const query = searchInput.value.trim().toLocaleLowerCase();
+      const accounts = dmCandidates.filter(a =>
+        !query ||
+        String(a.user_id || '').toLocaleLowerCase().includes(query) ||
+        String(a.display_name || '').toLocaleLowerCase().includes(query)
+      );
+      searchResults.replaceChildren();
+      if (!accounts.length) {
+        const empty = document.createElement('p');
+        empty.className = 'muted';
+        empty.textContent = dmCandidates.length
+          ? '検索条件に一致する相手はいません。'
+          : 'DMを送れる相手はいません。相手もあなたをフォローすると、ここに表示されます。';
+        searchResults.appendChild(empty);
+        return;
+      }
+      accounts.forEach(account => {
+        const row = document.createElement('div');
+        row.className = 'row between';
+        row.style.cssText = 'padding:9px 0;border-bottom:1px solid var(--line);gap:8px';
+        const info = document.createElement('div');
+        info.style.flex = '1';
+        info.innerHTML = '<strong>' + escapeHTML(account.display_name || account.user_id) + '</strong><div class="muted">@' + escapeHTML(account.user_id || '') + '</div>';
+        const start = document.createElement('button');
+        start.className = 'btn';
+        start.textContent = 'DMを開始';
+        start.addEventListener('click', async () => {
+          start.disabled = true;
+          start.textContent = '開始中…';
+          try {
+            const created = await api('create_dm', {account_id:account.id});
+            activeConversationId = created.conversation && created.conversation.id;
+            await loadPage();
+          } catch (error) {
+            const message = document.createElement('p');
+            message.className = 'muted';
+            message.textContent = error.message || 'DMを開始できませんでした。';
+            searchResults.prepend(message);
+            start.disabled = false;
+            start.textContent = 'DMを開始';
+          }
+        });
+        row.append(info, start);
+        searchResults.appendChild(row);
+      });
+    }
+    async function loadDmCandidates() {
+      searchButton.disabled = true;
+      searchResults.textContent = '一覧を読み込み中…';
+      try {
+        const found = await api('dm_candidates');
+        dmCandidates = found.accounts || [];
+        drawDmCandidates();
+      } catch (error) {
+        searchResults.textContent = 'DM可能な相手を取得できませんでした：' + (error.message || 'APIエラー');
+      } finally {
+        searchButton.disabled = false;
+      }
+    }
+    searchButton.addEventListener('click', loadDmCandidates);
+    searchInput.addEventListener('input', drawDmCandidates);
+    loadDmCandidates();
+    if (!conversations.length) {
+      list.innerHTML = '<p class="muted">DMはまだありません。上の検索から相互フォロー中の相手を選んでDMを開始してください。</p>';
+      return;
+    }
+    conversations.forEach(c => {
+      const b = document.createElement('button'); b.className = 'btn secondary';
+      b.style.cssText = 'margin:4px 6px 4px 0';
+      b.textContent = c.display_title || c.title || (c.conversation_type === 'direct' ? 'ユーザー不明' : 'グループ');
+      if (c.id === activeConversationId) b.style.background = '#245bb3';
+      b.addEventListener('click', () => { activeConversationId = c.id; renderMessages(result); });
+      list.appendChild(b);
+    });
+    const thread = wrap.querySelector('#dmThread');
+    const selected = conversations.find(c => c.id === activeConversationId) || conversations[0];
+    if (!activeConversationId || !conversations.some(c => c.id === activeConversationId)) activeConversationId = selected.id;
+    thread.innerHTML = '<div class="muted" style="margin-bottom:10px">メッセージ</div><div id="dmMessages" style="max-height:48vh;overflow:auto"></div><textarea id="dmText" maxlength="10000" placeholder="メッセージを入力" style="min-height:75px;margin-top:12px"></textarea><div class="row between" style="margin-top:8px"><span id="dmStatus" class="muted"></span><button class="btn" id="dmSend">送信</button></div>';
+    const messageBox = thread.querySelector('#dmMessages');
+    try {
+      const data = await api('get_messages', {conversation_id:activeConversationId});
+      (data.messages || []).forEach(m => {
+        const bubble = document.createElement('div'); bubble.className = 'post';
+        bubble.style.cssText = 'padding:10px 0;border-bottom:1px solid var(--line)';
+        bubble.innerHTML = '<div class="post-text"></div><div class="muted"></div>';
+        bubble.querySelector('.post-text').textContent = m.content || (m.attachment_url ? '添付ファイル: ' + m.attachment_url : '');
+        const senderLabel = m.sender_id === (currentUser && currentUser.id)
+          ? '自分'
+          : ((m.sender_display_name || m.sender_user_id || '不明なユーザー') + (m.sender_user_id ? ' (@' + m.sender_user_id + ')' : ''));
+        bubble.querySelector('.muted').textContent = senderLabel + ' · ' + new Date(m.created_at).toLocaleString();
+        messageBox.appendChild(bubble);
+      });
+      if (!(data.messages || []).length) messageBox.innerHTML = '<p class="muted">最初のメッセージを送ってみましょう。</p>';
+      messageBox.scrollTop = messageBox.scrollHeight;
+    } catch (error) { messageBox.textContent = error.message || 'メッセージを読み込めませんでした。'; }
+    thread.querySelector('#dmSend').addEventListener('click', async () => {
+      const input = thread.querySelector('#dmText'); const text = input.value.trim();
+      if (!text) { thread.querySelector('#dmStatus').textContent = 'メッセージを入力してください。'; return; }
+      const button = thread.querySelector('#dmSend'); button.disabled = true;
+      thread.querySelector('#dmStatus').textContent = '送信中…';
+      try { await api('send_message', {conversation_id:activeConversationId, text}); input.value = ''; await loadPage(); }
+      catch (error) { thread.querySelector('#dmStatus').textContent = error.message || '送信できませんでした。'; }
+      finally { button.disabled = false; }
+    });
+  }
+
+  function renderResult(result) {
+    if (page === "messages") { renderMessages(result); return; }
+    if (page === "profile") { renderProfile(result); return; }
+    if (page === "settings") { renderSettings(result); return; }
+    const root = $("content"); root.replaceChildren();
+    if (page === "search") {
+      const accounts = result.accounts || [];
+      const accountHeading = document.createElement('div'); accountHeading.className='panel'; accountHeading.innerHTML='<strong>ユーザー</strong>';
+      root.appendChild(accountHeading);
+      if (!accounts.length) { const empty=document.createElement('div'); empty.className='panel muted'; empty.textContent='一致するユーザーはいません。'; root.appendChild(empty); }
+      accounts.forEach(account => root.appendChild(accountCard(account)));
+      const postHeading=document.createElement('div'); postHeading.className='panel'; postHeading.innerHTML='<strong>投稿・ハッシュタグ</strong>'; root.appendChild(postHeading);
+      if ((result.hashtags || []).length) {
+        const tags=document.createElement('div'); tags.className='panel';
+        tags.innerHTML=(result.hashtags || []).map(t => '<button class="action" data-tag="#' + escapeHTML(t.tag) + '">#' + escapeHTML(t.tag) + '</button>').join('');
+        tags.querySelectorAll('[data-tag]').forEach(b=>b.addEventListener('click',()=>{ $('searchInput').value=b.dataset.tag; loadPage(); })); root.appendChild(tags);
+      }
+    }
+    const items = result.posts || result.items || result.data || result.notifications || result.conversations || [];
+    if (!Array.isArray(items) || items.length === 0) {
+      if (page !== 'search') root.innerHTML='<div class="panel muted">まだ表示する内容がありません。</div>';
+      else { const empty=document.createElement('div'); empty.className='panel muted'; empty.textContent='一致する投稿はありません。'; root.appendChild(empty); }
+      return;
+    }
+    for (const item of items) {
+      if (page === 'notifications') {
+        const n=document.createElement('div'); n.className='post'; n.textContent='通知: ' + (item.notification_type || '更新') + ' · ' + new Date(item.created_at).toLocaleString(); root.appendChild(n);
+      } else if (item.content !== undefined || item.text !== undefined) root.appendChild(postCard(item));
+      else {
+        const card=document.createElement('div'); card.className='post'; card.textContent=item.title || item.conversation_type || '項目'; root.appendChild(card);
+      }
+    }
+  }
+
+  document.querySelectorAll("[data-page]").forEach(button => {
+    button.addEventListener("click", () => {
+      page = button.dataset.page;
+      if (page === "profile") viewedProfileId = null;
+      document.querySelectorAll("[data-page]").forEach(item =>
+        item.classList.toggle("active", item === button)
+      );
+      loadPage();
+    });
+  });
+
+  $("searchInput").addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      page = "search";
+      loadPage();
+    }
+  });
+
+  $("logout").addEventListener("click", () => {
+    if (currentUser && sessionStorage.getItem("stax_token")) rememberAccount(currentUser, sessionStorage.getItem("stax_token"));
+    sessionStorage.removeItem("stax_token");
+    currentUser = null;
+    $("app").classList.add("hidden");
+    $("auth").classList.remove("hidden");
+    $("password").value = "";
+    status("ログアウトしました。");
+  });
+
+  async function restoreSession() {
+    if (!configured || !client) {
+      status("SupabaseのURLとPublishable Keyを設定してください。");
+      return;
+    }
+    const token = sessionStorage.getItem("stax_token");
+    if (!token) return;
+
+    try {
+      const result = await api("me");
+      showApp(result.user || result);
+    } catch {
+      sessionStorage.removeItem("stax_token");
+    }
+  }
+
+  restoreSession();
+})();
+</script>
+</body>
+</html>
