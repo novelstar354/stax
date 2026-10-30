@@ -60,7 +60,7 @@ async function authenticate(request: Request, supabase: ReturnType<typeof db>) {
 
   const { data: account, error: accountError } = await supabase
     .from("stax_accounts")
-    .select("id,user_id,display_name,is_private,is_banned,is_admin")
+    .select("id,user_id,display_name,avatar_url,is_private,is_banned,is_admin")
     .eq("id", session.account_id)
     .maybeSingle();
 
@@ -141,6 +141,37 @@ async function isConversationMember(
 
   if (error) throw error;
   return Boolean(data);
+}
+
+async function attachPostCounts(supabase: ReturnType<typeof db>, posts: any[]) {
+  return await Promise.all(posts.map(async (post) => {
+    const [{ count: comments, error: commentsError }, { count: reposts, error: repostsError }] = await Promise.all([
+      supabase.from("stax_posts").select("id", { count: "exact", head: true })
+        .eq("reply_to_id", post.id).eq("is_deleted", false),
+      supabase.from("stax_posts").select("id", { count: "exact", head: true })
+        .eq("repost_of_id", post.id).eq("is_deleted", false),
+    ]);
+    if (commentsError) throw commentsError;
+    if (repostsError) throw repostsError;
+    return { ...post, comment_count: comments || 0, repost_count: reposts || 0 };
+  }));
+}
+
+async function attachPostMedia(supabase: ReturnType<typeof db>, posts: any[]) {
+  if (!posts.length) return posts;
+  const ids = posts.map((post) => post.id).filter(Boolean);
+  if (!ids.length) return posts;
+  const { data, error } = await supabase.from("stax_post_media")
+    .select("post_id,media_url,media_type,position")
+    .in("post_id", ids).order("position", { ascending: true });
+  if (error) throw error;
+  const grouped = new Map<string, any[]>();
+  for (const media of data || []) {
+    const list = grouped.get(media.post_id) || [];
+    list.push(media);
+    grouped.set(media.post_id, list);
+  }
+  return posts.map((post) => ({ ...post, media: grouped.get(post.id) || [] }));
 }
 
 Deno.serve(async (request: Request) => {
@@ -273,7 +304,7 @@ Deno.serve(async (request: Request) => {
       if (!privateLocked) {
         const { data: rows, error: postsError } = await supabase.from("stax_posts")
           .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
-          .eq("author_id", user.id).eq("is_deleted", false)
+          .eq("author_id", user.id).eq("is_deleted", false).is("reply_to_id", null)
           .order("is_pinned", { ascending: false }).order("created_at", { ascending: false }).limit(100);
         if (postsError) throw postsError;
         for (const post of rows || []) {
@@ -293,7 +324,9 @@ Deno.serve(async (request: Request) => {
             liked_by_me: Boolean(liked), reposted_by_me: Boolean(repost) });
         }
       }
-      return json({ user, posts, private_locked: privateLocked,
+      const postsWithCounts = await attachPostCounts(supabase, posts);
+      const postsWithMedia = await attachPostMedia(supabase, postsWithCounts);
+      return json({ user, posts: postsWithMedia, private_locked: privateLocked,
         following_by_me, followed_by_me, requested_by_me: Boolean(pendingRequest),
         followers_count: followersCount || 0, following_count: followingCount || 0,
         is_me: user.id === myId });
@@ -387,8 +420,11 @@ Deno.serve(async (request: Request) => {
 
     // Create post / reply / quote
     if (action === "create_post" || action === "reply") {
-      const content = requiredText(body.text, 2000);
-      if (!content) return json({ error: "投稿内容を入力してください。" }, 400);
+      const content = requiredText(body.text, 2000) || "";
+      const images = action === "create_post" && Array.isArray(body.images) ? body.images : [];
+      if (images.length > 4) return json({ error: "画像は4枚まで添付できます。" }, 400);
+      if (!content && images.length === 0) return json({ error: "本文または画像を入力してください。" }, 400);
+      if (images.some((item: unknown) => typeof item !== "string")) return json({ error: "画像データが不正です。" }, 400);
 
       const replyTo = action === "reply" ? body.post_id : body.reply_to_id;
       const quoteId = body.quote_post_id;
@@ -427,6 +463,39 @@ Deno.serve(async (request: Request) => {
         .single();
 
       if (error) throw error;
+
+      // Upload post images to the public Storage bucket and save their metadata.
+      const uploadedPaths: string[] = [];
+      try {
+        const mediaRows = [];
+        for (let index = 0; index < images.length; index++) {
+          const dataUrl = images[index] as string;
+          const match = dataUrl.match(/^data:(image\/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)$/);
+          if (!match) throw new Error("PNG/JPEG/WEBP/GIF画像を選択してください。");
+          const mime = match[1];
+          let binary: string;
+          try { binary = atob(match[2]); } catch { throw new Error("画像データが不正です。"); }
+          if (binary.length < 1 || binary.length > 2 * 1024 * 1024) throw new Error("画像は1枚2MB以下にしてください。");
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const ext = mime === "image/jpeg" ? "jpg" : mime.split("/")[1];
+          const path = `${myId}/${post.id}/${crypto.randomUUID()}.${ext}`;
+          const { error: uploadError } = await supabase.storage.from("stax-post-images")
+            .upload(path, bytes, { contentType: mime, upsert: false, cacheControl: "3600" });
+          if (uploadError) throw uploadError;
+          uploadedPaths.push(path);
+          const { data: publicData } = supabase.storage.from("stax-post-images").getPublicUrl(path);
+          mediaRows.push({ post_id: post.id, media_url: publicData.publicUrl, media_type: mime, position: index });
+        }
+        if (mediaRows.length) {
+          const { error: mediaError } = await supabase.from("stax_post_media").insert(mediaRows);
+          if (mediaError) throw mediaError;
+        }
+      } catch (mediaError) {
+        if (uploadedPaths.length) await supabase.storage.from("stax-post-images").remove(uploadedPaths);
+        await supabase.from("stax_posts").update({ is_deleted: true }).eq("id", post.id).eq("author_id", myId);
+        throw mediaError;
+      }
 
       // Extract and attach hashtags.
       const tags = [...new Set(
@@ -493,6 +562,7 @@ Deno.serve(async (request: Request) => {
         .from("stax_posts")
         .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
         .eq("is_deleted", false)
+        .is("reply_to_id", null)
         .in("author_id", authorIds)
         .order("created_at", { ascending: false })
         .limit(50);
@@ -500,55 +570,95 @@ Deno.serve(async (request: Request) => {
       if (error) throw error;
 
       const visible = [];
-      for (const post of posts || []) {
-        if (await blockedEitherWay(supabase, myId, post.author_id)) continue;
+      for (const timelineEntry of posts || []) {
+        if (await blockedEitherWay(supabase, myId, timelineEntry.author_id)) continue;
 
-        const { data: author } = await supabase
-          .from("stax_accounts")
+        const { data: entryAuthor } = await supabase.from("stax_accounts")
           .select("user_id,display_name,avatar_url,is_private")
-          .eq("id", post.author_id)
-          .maybeSingle();
+          .eq("id", timelineEntry.author_id).maybeSingle();
+        if (!entryAuthor) continue;
 
-        if (!author) continue;
-        if (author.is_private && post.author_id !== myId &&
-            !(await isFollowing(supabase, myId, post.author_id))) continue;
-        if (post.visibility === "private" && post.author_id !== myId) continue;
-        if (post.visibility === "followers" && post.author_id !== myId &&
-            !(await isFollowing(supabase, myId, post.author_id))) continue;
+        // Reposts appear as an attribution above the original post, like X.
+        let post = timelineEntry;
+        let author = entryAuthor;
+        let repostedBy = null;
+        if (timelineEntry.repost_of_id) {
+          const { data: original, error: originalError } = await supabase.from("stax_posts")
+            .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned,is_deleted")
+            .eq("id", timelineEntry.repost_of_id).maybeSingle();
+          if (originalError) throw originalError;
+          if (!original || original.is_deleted) continue;
+          if (await blockedEitherWay(supabase, myId, original.author_id)) continue;
+          const { data: originalAuthor } = await supabase.from("stax_accounts")
+            .select("user_id,display_name,avatar_url,is_private")
+            .eq("id", original.author_id).maybeSingle();
+          if (!originalAuthor) continue;
+          if (originalAuthor.is_private && original.author_id !== myId &&
+              !(await isFollowing(supabase, myId, original.author_id))) continue;
+          if (original.visibility === "private" && original.author_id !== myId) continue;
+          if (original.visibility === "followers" && original.author_id !== myId &&
+              !(await isFollowing(supabase, myId, original.author_id))) continue;
+          repostedBy = entryAuthor.display_name || entryAuthor.user_id;
+          post = original;
+          author = originalAuthor;
+        } else {
+          if (entryAuthor.is_private && post.author_id !== myId &&
+              !(await isFollowing(supabase, myId, post.author_id))) continue;
+          if (post.visibility === "private" && post.author_id !== myId) continue;
+          if (post.visibility === "followers" && post.author_id !== myId &&
+              !(await isFollowing(supabase, myId, post.author_id))) continue;
+        }
 
-        const { count: likes } = await supabase
-          .from("stax_likes")
-          .select("*", { count: "exact", head: true })
-          .eq("post_id", post.id);
-
-        const { data: liked } = await supabase
-          .from("stax_likes")
-          .select("post_id")
-          .eq("post_id", post.id)
-          .eq("account_id", myId)
-          .maybeSingle();
-
-        const { data: myRepost, error: repostError } = await supabase
-          .from("stax_posts")
-          .select("id")
-          .eq("author_id", myId)
-          .eq("repost_of_id", post.id)
-          .eq("is_deleted", false)
-          .maybeSingle();
+        const { count: likes } = await supabase.from("stax_likes")
+          .select("*", { count: "exact", head: true }).eq("post_id", post.id);
+        const { data: liked } = await supabase.from("stax_likes")
+          .select("post_id").eq("post_id", post.id).eq("account_id", myId).maybeSingle();
+        const { data: myRepost, error: repostError } = await supabase.from("stax_posts")
+          .select("id").eq("author_id", myId).eq("repost_of_id", post.id)
+          .eq("is_deleted", false).maybeSingle();
         if (repostError) throw repostError;
 
-        visible.push({
-          ...post,
-          user_id: author.user_id,
-          display_name: author.display_name,
-          avatar_url: author.avatar_url,
-          like_count: likes || 0,
-          liked_by_me: Boolean(liked),
-          reposted_by_me: Boolean(myRepost),
-        });
+        visible.push({ ...post, timeline_entry_id: timelineEntry.id,
+          reposted_by_name: repostedBy,
+          reposted_by_user_id: timelineEntry.repost_of_id ? entryAuthor.user_id : null,
+          reposted_by_avatar_url: timelineEntry.repost_of_id ? entryAuthor.avatar_url : null,
+          user_id: author.user_id, display_name: author.display_name,
+          avatar_url: author.avatar_url, like_count: likes || 0,
+          liked_by_me: Boolean(liked), reposted_by_me: Boolean(myRepost) });
       }
 
-      return json({ posts: visible });
+      const postsWithCounts = await attachPostCounts(supabase, visible);
+      const postsWithMedia = await attachPostMedia(supabase, postsWithCounts);
+      return json({ posts: postsWithMedia });
+    }
+
+    // List comments for a post
+    if (action === "replies") {
+      const postId = body.post_id;
+      if (typeof postId !== "string") return json({ error: "post_id is required" }, 400);
+      const { data: parent, error: parentError } = await supabase.from("stax_posts")
+        .select("id,author_id,visibility,is_deleted").eq("id", postId).eq("is_deleted", false).maybeSingle();
+      if (parentError) throw parentError;
+      if (!parent) return json({ error: "投稿が見つかりません。" }, 404);
+      if (await blockedEitherWay(supabase, myId, parent.author_id)) return json({ error: "この投稿は表示できません。" }, 403);
+      if (parent.visibility !== "public" && parent.author_id !== myId && !(await isFollowing(supabase, myId, parent.author_id))) {
+        return json({ error: "この投稿は閲覧できません。" }, 403);
+      }
+      const { data: rows, error } = await supabase.from("stax_posts")
+        .select("id,author_id,content,created_at,visibility")
+        .eq("reply_to_id", postId).eq("is_deleted", false)
+        .order("created_at", { ascending: true }).limit(100);
+      if (error) throw error;
+      const replies = [];
+      for (const reply of rows || []) {
+        if (await blockedEitherWay(supabase, myId, reply.author_id)) continue;
+        const { data: author, error: authorError } = await supabase.from("stax_accounts")
+          .select("user_id,display_name").eq("id", reply.author_id).maybeSingle();
+        if (authorError) throw authorError;
+        if (!author) continue;
+        replies.push({ ...reply, ...author });
+      }
+      return json({ replies });
     }
 
     // Like / unlike
@@ -824,6 +934,7 @@ Deno.serve(async (request: Request) => {
         .from("stax_posts")
         .select("id,author_id,content,reply_to_id,repost_of_id,quote_post_id,visibility,created_at,is_pinned")
         .eq("is_deleted", false)
+        .is("reply_to_id", null)
         .ilike("content", `%${safeQuery}%`)
         .order("created_at", { ascending: false })
         .limit(30);
@@ -965,10 +1076,16 @@ Deno.serve(async (request: Request) => {
 
       const notifications = [];
       for (const item of data || []) {
-        if (item.actor_id && await blockedEitherWay(supabase, myId, item.actor_id)) {
-          continue;
+        if (item.actor_id && await blockedEitherWay(supabase, myId, item.actor_id)) continue;
+        let actor = null;
+        if (item.actor_id) {
+          const { data: account, error: actorError } = await supabase.from("stax_accounts")
+            .select("id,user_id,display_name,avatar_url")
+            .eq("id", item.actor_id).maybeSingle();
+          if (actorError) throw actorError;
+          actor = account;
         }
-        notifications.push(item);
+        notifications.push({ ...item, actor });
       }
 
       return json({ notifications });
@@ -1440,7 +1557,7 @@ Deno.serve(async (request: Request) => {
       if (!me.is_admin) return json({ error: "管理者権限が必要です。" }, 403);
 
       const { data, error } = await supabase
-        .from("stax_reports")
+        .from("stax_report_details")
         .select("*")
         .order("created_at", { ascending: false })
         .limit(100);
@@ -1507,6 +1624,7 @@ Deno.serve(async (request: Request) => {
     return json({ error: "Unknown action", action }, 400);
   } catch (error) {
     console.error("stax-api error:", error);
-    return json({ error: "サーバー処理に失敗しました。" }, 500);
+    const message = error instanceof Error ? error.message : String(error);
+    return json({ error: message || "サーバー処理に失敗しました。" }, 500);
   }
 });
