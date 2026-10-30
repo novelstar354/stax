@@ -69,7 +69,7 @@ textarea { min-height:100px;resize:vertical }
   border-radius:999px;padding:10px 17px;font-weight:700;
 }
 .btn.secondary { background:#18263a }
-.post { padding:18px 20px;border-bottom:1px solid var(--line) }
+.post { padding:18px 20px;border-bottom:1px solid var(--line);position:relative }
 .post-head { display:flex;gap:10px;align-items:center;margin-bottom:10px }
 .avatar {
   width:42px;height:42px;border-radius:50%;
@@ -78,9 +78,22 @@ textarea { min-height:100px;resize:vertical }
 }
 .muted { color:var(--muted);font-size:13px }
 .post-text { white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65 }
+.hashtag-link { display:inline;padding:0;border:0;background:transparent;color:#68a5ff;font:inherit;font-weight:650;cursor:pointer; }
+.hashtag-link:hover { text-decoration:underline;color:#9bc4ff }
+.hashtag-hint { margin-top:7px;color:var(--muted);font-size:12px }
+.hashtag-cloud { display:flex;gap:8px;flex-wrap:wrap }
 .actions { display:flex;justify-content:space-between;gap:8px;margin-top:14px }
+.post-menu-wrap{position:relative;margin-left:auto}.post-menu-trigger{font-size:22px;line-height:1;padding:5px 9px}.post-menu{position:absolute;right:0;top:34px;z-index:12;min-width:160px;padding:6px;background:#111c2b;border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 30px #0008}.post-menu button{display:block;width:100%;text-align:left;padding:10px;border:0;border-radius:8px;background:transparent;color:var(--text)}.post-menu button:hover{background:#20314a}.post-pinned{font-size:12px;color:#80b4ff;margin:0 0 8px}
 .action { background:transparent;border:0;color:var(--muted);padding:6px }
 .action:hover { color:var(--blue) }
+.post-count { color:var(--muted);font-size:12px;margin-left:4px }
+.reply-list { margin:12px 0 0 10px;padding-left:12px;border-left:2px solid var(--line) }
+.reply-item { padding:9px 0;border-bottom:1px solid var(--line) }
+.reply-item:last-child { border-bottom:0 }
+.reply-author { font-weight:700;font-size:13px }
+.reply-content { white-space:pre-wrap;overflow-wrap:anywhere;margin-top:4px;line-height:1.5 }
+.reply-composer { display:flex;gap:8px;margin-top:10px }
+.reply-composer input { min-width:0;flex:1 }
 .searchbox { margin-bottom:12px }
 .notice { color:var(--muted);font-size:13px;line-height:1.7 }
 #status { margin-top:10px;font-size:13px;color:#a9caff }
@@ -201,13 +214,14 @@ textarea { min-height:100px;resize:vertical }
         <div class="avatar" id="myAvatar">S</div>
         <div style="flex:1">
           <textarea id="postText" maxlength="2000" placeholder="いま、スターしてる？"></textarea>
+          <div class="hashtag-hint">#話題 のように入力すると、投稿後にクリックできるハッシュタグになります。</div>
         </div>
       </div>
       <div class="image-tools">
         <label class="image-pick">▧ 画像を添付
           <input id="postImages" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple>
         </label>
-        <span class="muted" id="imageCount">最大4枚・各1MBまで</span>
+        <span class="muted" id="imageCount">最大4枚・各2MBまで</span>
       </div>
       <div id="imagePreview" class="image-preview"></div>
       <div class="row between" style="margin-top:10px">
@@ -442,8 +456,8 @@ textarea { min-height:100px;resize:vertical }
   $("postImages").addEventListener("change", () => {
     const files = [...$("postImages").files];
     if (files.length > 4) { status("画像は4枚まで選択できます。", "content"); $("postImages").value = ""; return; }
-    const invalid = files.find(file => !["image/jpeg","image/png","image/webp","image/gif"].includes(file.type) || file.size > 1 * 1024 * 1024);
-    if (invalid) { status("PNG/JPEG/WEBP/GIF形式で、1枚1MB以下の画像を選択してください。", "content"); $("postImages").value = ""; return; }
+    const invalid = files.find(file => !["image/jpeg","image/png","image/webp","image/gif"].includes(file.type) || file.size > 2 * 1024 * 1024);
+    if (invalid) { status("PNG/JPEG/WEBP/GIF形式で、1枚2MB以下の画像を選択してください。", "content"); $("postImages").value = ""; return; }
     selectedPostFiles = files;
     const preview = $("imagePreview"); preview.replaceChildren();
     files.forEach((file, index) => {
@@ -457,13 +471,33 @@ textarea { min-height:100px;resize:vertical }
       });
       wrap.append(img, remove); preview.append(wrap);
     });
-    $("imageCount").textContent = files.length ? `${files.length}枚選択中` : "最大4枚・各1MBまで";
+    $("imageCount").textContent = files.length ? `${files.length}枚選択中` : "最大4枚・各2MBまで";
   });
 
   function fileToDataURL(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const scale = Math.min(1, 1280 / Math.max(img.width, img.height));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          let quality = 0.82;
+          let data = canvas.toDataURL("image/webp", quality);
+          while (data.length > 900_000 && quality > 0.45) {
+            quality -= 0.08;
+            data = canvas.toDataURL("image/webp", quality);
+          }
+          if (data.length > 900_000) return reject(new Error("画像を圧縮できませんでした。別の画像を選んでください。"));
+          resolve(data);
+        };
+        img.onerror = () => reject(new Error("画像を読み込めませんでした。"));
+        img.src = reader.result;
+      };
       reader.onerror = () => reject(new Error("画像を読み込めませんでした。"));
       reader.readAsDataURL(file);
     });
@@ -481,7 +515,7 @@ textarea { min-height:100px;resize:vertical }
       $("postImages").value = "";
       selectedPostFiles = [];
       $("imagePreview").replaceChildren();
-      $("imageCount").textContent = "最大4枚・各1MBまで";
+      $("imageCount").textContent = "最大4枚・各2MBまで";
       $("charCount").textContent = "0 / 2000";
       await loadPage();
     } catch (error) {
@@ -499,7 +533,7 @@ textarea { min-height:100px;resize:vertical }
     if (mobileTitle) mobileTitle.textContent = $("pageTitle").textContent;
 
     $("composer").classList.toggle("hidden", page !== "home");
-    $("content").innerHTML = '<div class="panel muted">読み込み中…</div>';
+    // 既存の表示を残し、画面全体の読み込み表示を抑える。
     try {
       let result;
       if (page === "profile") result = await api("profile", viewedProfileId ? {user_id:viewedProfileId} : {});
@@ -546,6 +580,29 @@ textarea { min-height:100px;resize:vertical }
     return el;
   }
 
+  function renderHashtagText(container, value) {
+    const text = String(value || "");
+    const pattern = /#([\p{L}\p{N}_]{1,50})/gu;
+    let lastIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const index = match.index ?? 0;
+      container.append(document.createTextNode(text.slice(lastIndex, index)));
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "hashtag-link";
+      button.textContent = match[0];
+      button.addEventListener("click", () => {
+        $("searchInput").value = match[0];
+        page = "search";
+        document.querySelectorAll("[data-page]").forEach(item => item.classList.toggle("active", item.dataset.page === "search"));
+        loadPage();
+      });
+      container.append(button);
+      lastIndex = index + match[0].length;
+    }
+    container.append(document.createTextNode(text.slice(lastIndex)));
+  }
+
   function postCard(post) {
     const article = document.createElement("article");
     article.className = "post";
@@ -553,11 +610,17 @@ textarea { min-height:100px;resize:vertical }
     article.innerHTML = '<div class="post-head">' + avatarMarkup(post) +
       '<div style="min-width:0"><strong>' + escapeHTML(author) + '</strong>' +
       '<div class="muted">@' + escapeHTML(post.user_id || "") + '</div></div>' +
-      '<button class="action" data-author-profile>プロフィール</button></div>' +
-      '<div class="post-text">' + escapeHTML(post.text || post.content || "") + '</div>' +
-      '<div class="actions"><button class="action" data-action="reply">返信</button>' +
-      '<button class="action" data-action="repost">' + (post.reposted_by_me ? 'リスター済み' : 'リスター') + '</button>' +
-      '<button class="action" data-action="like">' + (post.liked_by_me ? '♥ いいね済み' : '♡ いいね') + '</button></div>';
+      '<button class="action" data-author-profile>プロフィール</button>' +
+      '<div class="post-menu-wrap"><button class="action post-menu-trigger" aria-label="投稿メニュー" aria-expanded="false">⋯</button><div class="post-menu hidden">' +
+      (post.author_id === currentUser?.id ? '<button data-menu="pin">' + (post.is_pinned ? 'ピン留め解除' : 'ピン留め') + '</button><button data-menu="delete">削除</button>' : '<button data-menu="report">報告</button>') +
+      '</div></div></div>' +
+      (post.is_pinned ? '<div class="post-pinned">📌 ピン留め</div>' : '') +
+      '<div class="post-text"></div>' +
+      '<div class="actions"><button class="action" data-action="reply">コメント <span class="post-count">' + Number(post.comment_count || 0) + '</span></button>' +
+      '<button class="action" data-action="repost">' + (post.reposted_by_me ? 'リポスト済み' : 'リポスト') + ' <span class="post-count">' + Number(post.repost_count || 0) + '</span></button>' +
+      '<button class="action" data-action="like">' + (post.liked_by_me ? '♥' : '♡') + ' いいね <span class="post-count">' + Number(post.like_count || 0) + '</span></button></div>' +
+      '<div class="reply-area" hidden></div>';
+    renderHashtagText(article.querySelector('.post-text'), post.text || post.content || "");
     if (Array.isArray(post.media) && post.media.length) {
       const mediaBox = document.createElement("div"); mediaBox.className = "post-media";
       post.media.forEach(media => {
@@ -573,13 +636,62 @@ textarea { min-height:100px;resize:vertical }
       document.querySelectorAll("[data-page]").forEach(item => item.classList.toggle("active", item.dataset.page === "profile"));
       loadPage();
     });
+    const menuTrigger = article.querySelector(".post-menu-trigger");
+    const menu = article.querySelector(".post-menu");
+    menuTrigger.addEventListener("click", (event) => {
+      event.stopPropagation();
+      menu.classList.toggle("hidden");
+      menuTrigger.setAttribute("aria-expanded", String(!menu.classList.contains("hidden")));
+    });
+    menu.querySelectorAll("[data-menu]").forEach(item => item.addEventListener("click", async () => {
+      const choice = item.dataset.menu;
+      menu.classList.add("hidden");
+      try {
+        if (choice === "delete") {
+          if (!confirm("この投稿を削除しますか？")) return;
+          await api("delete_post", {post_id:post.id});
+          article.remove();
+        } else if (choice === "pin") {
+          await api("pin_post", {post_id:post.id, pinned:!post.is_pinned});
+          await loadPage();
+        } else if (choice === "report") {
+          const reason = prompt("報告理由を入力してください。");
+          if (reason?.trim()) await api("report", {post_id:post.id,reason:reason.trim()});
+        }
+      } catch (error) { status(error.message, "content"); }
+    }));
     article.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
       const action = button.dataset.action, postId = post.id || post.post_id;
       if (!postId) return;
       try {
         if (action === "reply") {
-          const text = prompt("返信内容を入力してください");
-          if (text && text.trim()) { await api("reply", {post_id:postId,text:text.trim()}); status("返信しました。", "content"); }
+          const area = article.querySelector('.reply-area');
+          if (area.hidden) {
+            area.hidden = false;
+            area.innerHTML = '<div class="reply-composer"><input maxlength="2000" placeholder="コメントを書く…"><button class="btn" type="button">送信</button></div><div class="reply-list"></div>';
+            const input = area.querySelector('input');
+            const send = area.querySelector('button');
+            const refreshReplies = async () => {
+              const result = await api('replies', {post_id:postId});
+              const list = area.querySelector('.reply-list'); list.replaceChildren();
+              (result.replies || []).forEach(reply => {
+                const item = document.createElement('div'); item.className = 'reply-item';
+                const who = document.createElement('div'); who.className = 'reply-author'; who.textContent = reply.display_name || reply.user_id || 'ユーザー';
+                const body = document.createElement('div'); body.className = 'reply-content'; body.textContent = reply.content || '';
+                item.append(who, body); list.append(item);
+              });
+              if (!list.childElementCount) list.textContent = 'まだコメントはありません。';
+              const count = article.querySelector('[data-action="reply"] .post-count'); if (count) count.textContent = String(result.replies?.length || 0);
+            };
+            send.addEventListener('click', async () => {
+              const value = input.value.trim(); if (!value) return;
+              send.disabled = true;
+              try { await api('reply', {post_id:postId,text:value}); input.value=''; await refreshReplies(); }
+              catch(error) { status(error.message,'content'); }
+              finally { send.disabled=false; }
+            });
+            await refreshReplies();
+          } else { area.hidden = true; }
         } else {
           await api(action === "like" ? "like" : "repost", {post_id:postId});
           await loadPage();
@@ -795,7 +907,7 @@ textarea { min-height:100px;resize:vertical }
     }
     async function loadDmCandidates() {
       searchButton.disabled = true;
-      searchResults.textContent = '一覧を読み込み中…';
+      searchResults.replaceChildren();
       try {
         const found = await api('dm_candidates');
         dmCandidates = found.accounts || [];
@@ -866,7 +978,7 @@ textarea { min-height:100px;resize:vertical }
       accounts.forEach(account => root.appendChild(accountCard(account)));
       const postHeading=document.createElement('div'); postHeading.className='panel'; postHeading.innerHTML='<strong>投稿・ハッシュタグ</strong>'; root.appendChild(postHeading);
       if ((result.hashtags || []).length) {
-        const tags=document.createElement('div'); tags.className='panel';
+        const tags=document.createElement('div'); tags.className='panel hashtag-cloud';
         tags.innerHTML=(result.hashtags || []).map(t => '<button class="action" data-tag="#' + escapeHTML(t.tag) + '">#' + escapeHTML(t.tag) + '</button>').join('');
         tags.querySelectorAll('[data-tag]').forEach(b=>b.addEventListener('click',()=>{ $('searchInput').value=b.dataset.tag; loadPage(); })); root.appendChild(tags);
       }
@@ -879,7 +991,12 @@ textarea { min-height:100px;resize:vertical }
     }
     for (const item of items) {
       if (page === 'notifications') {
-        const n=document.createElement('div'); n.className='post'; n.textContent='通知: ' + (item.notification_type || '更新') + ' · ' + new Date(item.created_at).toLocaleString(); root.appendChild(n);
+        const n=document.createElement('div'); n.className='post';
+        const actor = item.actor || {};
+        const who = actor.display_name || actor.user_id || 'ユーザー';
+        const labels = {like:'いいねしました',repost:'リポストしました',reply:'コメントしました',follow:'フォローしました',follow_request:'フォロー申請しました',follow_accepted:'フォロー申請を承認しました',mention:'あなたに関連する投稿をしました'};
+        n.textContent = who + ' さんが' + (labels[item.notification_type] || 'アクションしました') + ' · ' + new Date(item.created_at).toLocaleString();
+        root.appendChild(n);
       } else if (item.content !== undefined || item.text !== undefined) root.appendChild(postCard(item));
       else {
         const card=document.createElement('div'); card.className='post'; card.textContent=item.title || item.conversation_type || '項目'; root.appendChild(card);
