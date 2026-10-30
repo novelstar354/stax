@@ -142,6 +142,16 @@ textarea { min-height:100px;resize:vertical }
 @media(prefers-reduced-motion:reduce) {
   .sidebar { transition:none; }
 }
+.image-tools{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+.image-pick{display:inline-flex;align-items:center;gap:7px;padding:9px 13px;border:1px solid var(--line);border-radius:999px;color:#b9d5ff;cursor:pointer;background:#111c2b}
+.image-pick input{display:none}
+.image-preview{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.image-preview-item{position:relative;width:84px;height:84px}
+.image-preview-item img{width:100%;height:100%;object-fit:cover;border-radius:10px;border:1px solid var(--line)}
+.image-preview-item button{position:absolute;right:-6px;top:-6px;border:0;border-radius:50%;width:24px;height:24px;background:#d83d54;color:white}
+.post-media{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:10px}
+.post-media img{width:100%;max-height:420px;object-fit:cover;border-radius:12px;border:1px solid var(--line)}
+@media(max-width:600px){.post-media img{max-height:300px}}
 </style>
 </head>
 <body>
@@ -193,6 +203,13 @@ textarea { min-height:100px;resize:vertical }
           <textarea id="postText" maxlength="2000" placeholder="いま、スターしてる？"></textarea>
         </div>
       </div>
+      <div class="image-tools">
+        <label class="image-pick">▧ 画像を添付
+          <input id="postImages" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple>
+        </label>
+        <span class="muted" id="imageCount">最大4枚・各1MBまで</span>
+      </div>
+      <div id="imagePreview" class="image-preview"></div>
       <div class="row between" style="margin-top:10px">
         <span class="muted" id="charCount">0 / 2000</span>
         <button class="btn" id="publish">投稿する</button>
@@ -421,14 +438,50 @@ textarea { min-height:100px;resize:vertical }
     $("charCount").textContent = $("postText").value.length + " / 2000";
   });
 
+  let selectedPostFiles = [];
+  $("postImages").addEventListener("change", () => {
+    const files = [...$("postImages").files];
+    if (files.length > 4) { status("画像は4枚まで選択できます。", "content"); $("postImages").value = ""; return; }
+    const invalid = files.find(file => !["image/jpeg","image/png","image/webp","image/gif"].includes(file.type) || file.size > 1 * 1024 * 1024);
+    if (invalid) { status("PNG/JPEG/WEBP/GIF形式で、1枚1MB以下の画像を選択してください。", "content"); $("postImages").value = ""; return; }
+    selectedPostFiles = files;
+    const preview = $("imagePreview"); preview.replaceChildren();
+    files.forEach((file, index) => {
+      const wrap = document.createElement("div"); wrap.className = "image-preview-item";
+      const img = document.createElement("img"); img.src = URL.createObjectURL(file); img.alt = "添付画像";
+      const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "×"; remove.title = "削除";
+      remove.addEventListener("click", () => {
+        selectedPostFiles.splice(index, 1);
+        const dt = new DataTransfer(); selectedPostFiles.forEach(f => dt.items.add(f)); $("postImages").files = dt.files;
+        $("postImages").dispatchEvent(new Event("change"));
+      });
+      wrap.append(img, remove); preview.append(wrap);
+    });
+    $("imageCount").textContent = files.length ? `${files.length}枚選択中` : "最大4枚・各1MBまで";
+  });
+
+  function fileToDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("画像を読み込めませんでした。"));
+      reader.readAsDataURL(file);
+    });
+  }
+
   $("publish").addEventListener("click", async () => {
     const text = $("postText").value.trim();
-    if (!text) return status("投稿内容を入力してください。","content");
+    if (!text && !selectedPostFiles.length) return status("本文または画像を入力してください。","content");
 
     $("publish").disabled = true;
     try {
-      await api("create_post",{text});
+      const images = await Promise.all(selectedPostFiles.map(fileToDataURL));
+      await api("create_post",{text,images});
       $("postText").value = "";
+      $("postImages").value = "";
+      selectedPostFiles = [];
+      $("imagePreview").replaceChildren();
+      $("imageCount").textContent = "最大4枚・各1MBまで";
       $("charCount").textContent = "0 / 2000";
       await loadPage();
     } catch (error) {
@@ -505,6 +558,15 @@ textarea { min-height:100px;resize:vertical }
       '<div class="actions"><button class="action" data-action="reply">返信</button>' +
       '<button class="action" data-action="repost">' + (post.reposted_by_me ? 'リスター済み' : 'リスター') + '</button>' +
       '<button class="action" data-action="like">' + (post.liked_by_me ? '♥ いいね済み' : '♡ いいね') + '</button></div>';
+    if (Array.isArray(post.media) && post.media.length) {
+      const mediaBox = document.createElement("div"); mediaBox.className = "post-media";
+      post.media.forEach(media => {
+        if (!media || typeof media.media_url !== "string" || !/^https?:\/\//i.test(media.media_url)) return;
+        const img = document.createElement("img"); img.src = media.media_url; img.alt = "投稿画像"; img.loading = "lazy";
+        mediaBox.append(img);
+      });
+      if (mediaBox.childElementCount) article.querySelector(".post-text").after(mediaBox);
+    }
     article.querySelector('[data-author-profile]').addEventListener('click', () => {
       if (!post.user_id) return;
       viewedProfileId = post.user_id; page = "profile";
