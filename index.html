@@ -38,8 +38,8 @@ button:focus-visible,input:focus-visible,textarea:focus-visible {
   display:grid;
   grid-template-columns:220px minmax(0,600px) 240px;
 }
-.sidebar,.rightbar { padding:20px 14px }
-.sidebar { border-right:1px solid var(--line) }
+.sidebar,.rightbar { padding:20px 14px; position:sticky; top:0; height:100vh; overflow:hidden; align-self:start; }
+.sidebar { border-right:1px solid var(--line);display:flex;flex-direction:column; }
 .rightbar { border-left:1px solid var(--line) }
 .logo { font-size:30px;font-weight:850;letter-spacing:-1px }
 .logo span { color:var(--blue) }
@@ -49,6 +49,12 @@ button:focus-visible,input:focus-visible,textarea:focus-visible {
   border-radius:12px;background:transparent;color:var(--text)
 }
 .nav:hover,.nav.active { background:#18263a }
+.sidebar-account { margin-top:auto; padding:14px 8px 4px; border-top:1px solid var(--line); display:flex; align-items:center; gap:10px; min-width:0; }
+.sidebar-account-avatar { width:42px;height:42px;border-radius:50%;background:#1d3760;color:#b9d5ff;display:grid;place-items:center;font-weight:800;flex:0 0 42px;overflow:hidden; }
+.sidebar-account-avatar img { width:100%;height:100%;object-fit:cover;display:block; }
+.sidebar-account-info { min-width:0;flex:1;line-height:1.45; }
+.sidebar-account-name { display:block;font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+.sidebar-account-id { display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
 .main { min-width:0 }
 .top {
   padding:18px 20px;
@@ -130,7 +136,7 @@ textarea { min-height:100px;resize:vertical }
   .mobile-current-page { margin-left:auto;color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
   .sidebar {
     display:block;position:fixed;z-index:31;top:0;bottom:0;left:0;
-    width:min(82vw,300px);height:100dvh;overflow-y:auto;
+    width:min(82vw,300px);height:100dvh;overflow:hidden;overscroll-behavior:none;
     padding:18px 14px calc(24px + env(safe-area-inset-bottom));
     background:#0b111b;border-right:1px solid var(--line);
     box-shadow:18px 0 50px rgba(0,0,0,.38);
@@ -165,6 +171,27 @@ textarea { min-height:100px;resize:vertical }
 .post-media{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:10px}
 .post-media img{width:100%;max-height:420px;object-fit:cover;border-radius:12px;border:1px solid var(--line)}
 @media(max-width:600px){.post-media img{max-height:300px}}
+
+/* In-app dialogs: replace native alert/confirm/prompt UI */
+.ui-modal-backdrop{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.68);backdrop-filter:blur(7px)}
+.ui-modal-backdrop.open{display:flex}
+.ui-modal{width:min(440px,100%);background:#101722;border:1px solid #30415a;border-radius:18px;padding:20px;box-shadow:0 24px 80px #000a;animation:modal-in .16s ease-out}
+@keyframes modal-in{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+.ui-modal h2{font-size:19px;margin:0 0 8px}
+.ui-modal p{margin:0 0 14px;color:#a8b7ca;line-height:1.6;white-space:pre-line}
+.ui-modal select,.ui-modal textarea,.ui-modal input{width:100%;background:#0b111a;color:#f4f7fb;border:1px solid #30415a;border-radius:11px;padding:11px;font:inherit;margin:5px 0 12px}
+.ui-modal textarea{min-height:100px;resize:vertical}
+.ui-modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:8px}
+.ui-modal-actions button{border:0;border-radius:999px;padding:10px 16px;font:inherit;font-weight:700;cursor:pointer}
+.ui-modal-cancel{background:#202d40;color:#e8eef8}
+.ui-modal-ok{background:#3984ff;color:white}
+.ui-modal-ok.danger{background:#d94359}
+@media(prefers-reduced-motion:reduce){.ui-modal{animation:none}}
+
+
+  .repost-attribution{display:flex;align-items:center;gap:7px;color:var(--muted,#8b98a8);font-size:13px;font-weight:600;margin:0 0 8px 34px}
+  .repost-attribution .repost-icon{font-size:15px;color:#00ba7c}
+  .original-post-label{font-size:12px;color:var(--muted,#8b98a8);margin:0 0 7px 34px;padding:5px 9px;border-left:2px solid #3984ff;background:rgba(57,132,255,.06);border-radius:0 7px 7px 0}
 </style>
 </head>
 <body>
@@ -205,6 +232,13 @@ textarea { min-height:100px;resize:vertical }
     <button class="nav" data-page="settings">⚙ 設定</button>
     <button class="nav" id="accountSwitch">⇄ アカウント切替</button>
     <button class="nav" id="logout">↪ ログアウト</button>
+    <div class="sidebar-account" id="sidebarAccount" aria-label="ログイン中のアカウント">
+      <div class="sidebar-account-avatar" id="sidebarAccountAvatar">S</div>
+      <div class="sidebar-account-info">
+        <span class="sidebar-account-name" id="sidebarAccountName">ログイン中</span>
+        <span class="sidebar-account-id" id="sidebarAccountId">@-</span>
+      </div>
+    </div>
   </aside>
 
   <main class="main">
@@ -244,6 +278,19 @@ textarea { min-height:100px;resize:vertical }
   </aside>
 </div>
 
+
+<div id="uiModalBackdrop" class="ui-modal-backdrop" role="presentation">
+  <section class="ui-modal" role="dialog" aria-modal="true" aria-labelledby="uiModalTitle" aria-describedby="uiModalMessage">
+    <h2 id="uiModalTitle">確認</h2>
+    <p id="uiModalMessage"></p>
+    <div id="uiModalField"></div>
+    <div class="ui-modal-actions">
+      <button type="button" class="ui-modal-cancel" id="uiModalCancel">キャンセル</button>
+      <button type="button" class="ui-modal-ok" id="uiModalOk">決定</button>
+    </div>
+  </section>
+</div>
+
 <script>
 (() => {
   "use strict";
@@ -273,6 +320,59 @@ textarea { min-height:100px;resize:vertical }
   function status(message, target = "authStatus") {
     $(target).textContent = message;
   }
+
+  let modalResolver = null;
+  function closeUiModal(value = null) {
+    $("uiModalBackdrop").classList.remove("open");
+    document.body.style.overflow = "";
+    const resolve = modalResolver;
+    modalResolver = null;
+    if (resolve) resolve(value);
+  }
+  function openUiModal({title="確認", message="", field=null, confirmText="決定", danger=false, cancelText="キャンセル"} = {}) {
+    return new Promise(resolve => {
+      modalResolver = resolve;
+      $("uiModalTitle").textContent = title;
+      $("uiModalMessage").textContent = message;
+      $("uiModalCancel").textContent = cancelText;
+      $("uiModalOk").textContent = confirmText;
+      $("uiModalOk").classList.toggle("danger", danger);
+      const holder = $("uiModalField");
+      holder.replaceChildren();
+      let control = null;
+      if (field) {
+        control = document.createElement(field.type === "select" ? "select" : field.type === "textarea" ? "textarea" : "input");
+        if (field.type !== "select" && field.type !== "textarea") control.type = field.type || "text";
+        if (field.placeholder) control.placeholder = field.placeholder;
+        if (field.value !== undefined) control.value = field.value;
+        if (field.maxLength) control.maxLength = field.maxLength;
+        if (field.rows && field.type === "textarea") control.rows = field.rows;
+        if (field.type === "select") {
+          (field.options || []).forEach((option, index) => {
+            const node = document.createElement("option");
+            node.value = String(index);
+            node.textContent = option.label;
+            control.append(node);
+          });
+        }
+        holder.append(control);
+      }
+      $("uiModalBackdrop").classList.add("open");
+      document.body.style.overflow = "hidden";
+      $("uiModalCancel").onclick = () => closeUiModal(null);
+      $("uiModalOk").onclick = () => closeUiModal(control ? control.value : true);
+      $("uiModalBackdrop").onclick = event => { if (event.target === $("uiModalBackdrop")) closeUiModal(null); };
+      $("uiModalOk").disabled = false;
+      requestAnimationFrame(() => control ? control.focus() : $("uiModalOk").focus());
+    });
+  }
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && $("uiModalBackdrop")?.classList.contains("open")) closeUiModal(null);
+    if (event.key === "Enter" && $("uiModalBackdrop")?.classList.contains("open") && event.target.tagName !== "TEXTAREA") {
+      event.preventDefault();
+      $("uiModalOk").click();
+    }
+  });
 
   function escapeHTML(value) {
     return String(value).replace(/[&<>"']/g, char => ({
@@ -308,12 +408,36 @@ textarea { min-height:100px;resize:vertical }
   $("drawerBackdrop").addEventListener("click", closeMobileMenu);
   document.addEventListener("keydown", event => { if (event.key === "Escape") closeMobileMenu(); });
 
+  function updateSidebarAccount(user = currentUser) {
+    if (!user) return;
+    const avatar = $("sidebarAccountAvatar");
+    avatar.replaceChildren();
+    if (user.avatar_url) {
+      const img = document.createElement("img");
+      img.src = user.avatar_url;
+      img.alt = "";
+      img.onerror = () => { avatar.textContent = (user.display_name || user.user_id || "S").slice(0,1).toUpperCase(); };
+      avatar.appendChild(img);
+    } else {
+      avatar.textContent = (user.display_name || user.user_id || "S").slice(0,1).toUpperCase();
+    }
+    $("sidebarAccountName").textContent = user.display_name || user.user_id || "ユーザー";
+    $("sidebarAccountId").textContent = "@" + (user.user_id || "-");
+    $("myAvatar").replaceChildren();
+    if (user.avatar_url) {
+      const img = document.createElement("img"); img.src = user.avatar_url; img.alt = "";
+      img.style.cssText = "width:100%;height:100%;object-fit:cover;border-radius:50%";
+      $("myAvatar").appendChild(img);
+    } else {
+      $("myAvatar").textContent = (user.display_name || user.user_id || "S").slice(0,1).toUpperCase();
+    }
+  }
+
   function showApp(user) {
     currentUser = user;
     $("auth").classList.add("hidden");
     $("app").classList.remove("hidden");
-    $("myAvatar").textContent =
-      (user.display_name || user.user_id || "S").slice(0,1).toUpperCase();
+    updateSidebarAccount(user);
     loadPage();
   }
 
@@ -387,7 +511,15 @@ textarea { min-height:100px;resize:vertical }
       // 本番ではHttpOnly Cookieを使う構成がより安全です。
       // localStorageへの長期保存はXSSの影響を受ける可能性があります。
       sessionStorage.setItem("stax_token", result.token);
-      const user = result.user || { user_id, display_name:display_name || user_id };
+      // ログイン応答にプロフィール画像が含まれない場合があるため、
+      // stax-api の me から avatar_url を含む最新プロフィールを取得する。
+      let user = result.user || { user_id, display_name:display_name || user_id };
+      try {
+        const profile = await api("me");
+        user = profile.user || profile || user;
+      } catch (profileError) {
+        console.warn("プロフィール情報の取得に失敗しました:", profileError);
+      }
       rememberAccount(user, result.token);
       showApp(user);
     } catch (error) {
@@ -412,11 +544,19 @@ textarea { min-height:100px;resize:vertical }
       if (currentUser && sessionStorage.getItem("stax_token")) rememberAccount(currentUser, sessionStorage.getItem("stax_token"));
       let list = [];
       try { list = JSON.parse(sessionStorage.getItem("stax_saved_accounts") || "[]"); } catch {}
-      const choices = list.map((x,i) => `${i+1}. ${x.display_name} (@${x.user_id})`).join("\n");
-      const choice = prompt("切り替えるアカウントの番号を入力してください。\n\n" + (choices || "保存済みアカウントはありません。") + "\n\n別アカウントにログインする場合はキャンセルしてログアウト後にログインしてください。");
+      if (!list.length) {
+        await openUiModal({title:"アカウント切替", message:"保存済みアカウントはありません。別のアカウントにログインする場合は、ログアウトしてください。", confirmText:"閉じる", cancelText:""});
+        return;
+      }
+      const choice = await openUiModal({
+        title:"アカウントを切り替え",
+        message:"切り替えるアカウントを選択してください。",
+        field:{type:"select", options:list.map(x => ({label:`${x.display_name} (@${x.user_id})`}))},
+        confirmText:"切り替える"
+      });
       if (choice === null) return;
-      const index = Number(choice) - 1;
-      if (!Number.isInteger(index) || index < 0 || index >= list.length) throw new Error("有効な番号を入力してください。");
+      const index = Number(choice);
+      if (!Number.isInteger(index) || index < 0 || index >= list.length) return;
       sessionStorage.setItem("stax_token", list[index].token);
       const result = await api("me");
       rememberAccount(result.user || result, list[index].token);
@@ -607,7 +747,23 @@ textarea { min-height:100px;resize:vertical }
     const article = document.createElement("article");
     article.className = "post";
     const author = post.display_name || post.user_id || "ユーザー";
-    article.innerHTML = '<div class="post-head">' + avatarMarkup(post) +
+    if (post.reposted_by_name) {
+      const attribution = document.createElement("div");
+      attribution.className = "repost-attribution";
+      const icon = document.createElement("span");
+      icon.className = "repost-icon";
+      icon.textContent = "↻";
+      const label = document.createElement("span");
+      const reposterName = post.reposted_by_name || post.reposted_by_user_id || "ユーザー";
+      label.textContent = reposterName + "さん" + (post.reposted_by_user_id ? " (@" + post.reposted_by_user_id + ")" : "") + "がリポスト";
+      attribution.append(icon, label);
+      article.append(attribution);
+      const originalLabel = document.createElement("div");
+      originalLabel.className = "original-post-label";
+      originalLabel.textContent = "元の投稿 · 投稿したアカウント: " + author + (post.user_id ? " (@" + post.user_id + ")" : "");
+      article.append(originalLabel);
+    }
+    article.innerHTML += '<div class="post-head">' + avatarMarkup(post) +
       '<div style="min-width:0"><strong>' + escapeHTML(author) + '</strong>' +
       '<div class="muted">@' + escapeHTML(post.user_id || "") + '</div></div>' +
       '<button class="action" data-author-profile>プロフィール</button>' +
@@ -648,15 +804,16 @@ textarea { min-height:100px;resize:vertical }
       menu.classList.add("hidden");
       try {
         if (choice === "delete") {
-          if (!confirm("この投稿を削除しますか？")) return;
+          const confirmed = await openUiModal({title:"投稿を削除", message:"この投稿を削除しますか？この操作は取り消せません。", confirmText:"削除する", danger:true});
+          if (!confirmed) return;
           await api("delete_post", {post_id:post.id});
           article.remove();
         } else if (choice === "pin") {
           await api("pin_post", {post_id:post.id, pinned:!post.is_pinned});
           await loadPage();
         } else if (choice === "report") {
-          const reason = prompt("報告理由を入力してください。");
-          if (reason?.trim()) await api("report", {post_id:post.id,reason:reason.trim()});
+          const reason = await openUiModal({title:"投稿を報告", message:"報告する理由を入力してください。", field:{type:"textarea",placeholder:"報告理由",maxLength:500}, confirmText:"報告する", danger:true});
+          if (typeof reason === "string" && reason.trim()) await api("report", {post_id:post.id,reason:reason.trim()});
         }
       } catch (error) { status(error.message, "content"); }
     }));
@@ -676,9 +833,44 @@ textarea { min-height:100px;resize:vertical }
               const list = area.querySelector('.reply-list'); list.replaceChildren();
               (result.replies || []).forEach(reply => {
                 const item = document.createElement('div'); item.className = 'reply-item';
-                const who = document.createElement('div'); who.className = 'reply-author'; who.textContent = reply.display_name || reply.user_id || 'ユーザー';
+                const head = document.createElement('div'); head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px';
+                const who = document.createElement('div'); who.className = 'reply-author'; who.textContent = (reply.display_name || reply.user_id || 'ユーザー') + (reply.user_id ? ' @' + reply.user_id : '');
+                head.append(who);
                 const body = document.createElement('div'); body.className = 'reply-content'; body.textContent = reply.content || '';
-                item.append(who, body); list.append(item);
+                item.append(head, body);
+                if (currentUser && reply.author_id === currentUser.id) {
+                  const menuWrap = document.createElement('div');
+                  menuWrap.className = 'post-menu-wrap';
+                  const trigger = document.createElement('button');
+                  trigger.type = 'button'; trigger.className = 'action post-menu-trigger';
+                  trigger.textContent = '⋯'; trigger.title = 'コメントメニュー'; trigger.setAttribute('aria-label','コメントメニュー');
+                  const menu = document.createElement('div'); menu.className = 'post-menu'; menu.hidden = true;
+                  const edit = document.createElement('button'); edit.type = 'button'; edit.textContent = '編集';
+                  const del = document.createElement('button'); del.type = 'button'; del.textContent = '削除';
+                  trigger.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    const willOpen = menu.hidden;
+                    list.querySelectorAll('.post-menu').forEach(other => { if (other !== menu) other.hidden = true; });
+                    menu.hidden = !willOpen;
+                  });
+                  menu.addEventListener('click', event => event.stopPropagation());
+                  edit.addEventListener('click', async () => {
+                    menu.hidden = true;
+                    const value = await openUiModal({title:'コメントを編集',message:'コメント内容を変更できます。',field:{type:'textarea',placeholder:'コメント',value:reply.content || '',maxLength:2000,rows:4},confirmText:'保存する'});
+                    if (typeof value !== 'string' || !value.trim()) return;
+                    try { await api('edit_reply',{reply_id:reply.id,text:value.trim()}); await refreshReplies(); }
+                    catch(error) { status(error.message,'content'); }
+                  });
+                  del.addEventListener('click', async () => {
+                    menu.hidden = true;
+                    const ok = await openUiModal({title:'コメントを削除',message:'このコメントを削除しますか？',confirmText:'削除する',danger:true});
+                    if (!ok) return;
+                    try { await api('delete_post',{post_id:reply.id}); await refreshReplies(); }
+                    catch(error) { status(error.message,'content'); }
+                  });
+                  menu.append(edit,del); menuWrap.append(trigger,menu); head.append(menuWrap);
+                }
+                list.append(item);
               });
               if (!list.childElementCount) list.textContent = 'まだコメントはありません。';
               const count = article.querySelector('[data-action="reply"] .post-count'); if (count) count.textContent = String(result.replies?.length || 0);
@@ -756,6 +948,7 @@ textarea { min-height:100px;resize:vertical }
           is_private:panel.querySelector('#settingsPrivate').checked
         });
         currentUser = saved.user || currentUser;
+        updateSidebarAccount(currentUser);
         rememberAccount(currentUser, sessionStorage.getItem('stax_token'));
         const myAvatarEl = $("myAvatar");
         myAvatarEl.replaceChildren();
