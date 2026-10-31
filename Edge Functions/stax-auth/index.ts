@@ -186,18 +186,20 @@ Deno.serve(async (request: Request) => {
       }, 201);
     }
 
-    if (action === "login") {
+        if (action === "login") {
       const userId = body.user_id;
       const password = body.password;
 
       if (!validUserId(userId) || !validPassword(password)) {
-        return json({ error: "IDまたはパスワードが正しくありません。" }, 401);
+        return json({
+          error: "IDまたはパスワードが正しくありません。",
+        }, 401);
       }
 
       const { data: account, error } = await supabase
         .from("stax_accounts")
         .select(
-          "id,user_id,display_name,password_hash,avatar_url,bio,is_private,is_banned",
+          "id,user_id,display_name,password_hash,avatar_url,bio,is_private,is_banned,ban_reason",
         )
         .ilike("user_id", userId)
         .maybeSingle();
@@ -205,36 +207,46 @@ Deno.serve(async (request: Request) => {
       if (error) throw error;
 
       if (
-  !account ||
-  !(await bcrypt.compare(password, account.password_hash))
-) {
-  return json({ error: "IDまたはパスワードが正しくありません。" }, 401);
-}
+        !account ||
+        !(await bcrypt.compare(password, account.password_hash))
+      ) {
+        return json({
+          error: "IDまたはパスワードが正しくありません。",
+        }, 401);
+      }
 
-if (account.is_banned) {
-  const banReason =
-    typeof account.ban_reason === "string" && account.ban_reason.trim()
-      ? account.ban_reason.trim()
-      : "理由は登録されていません。";
+      // BAN状態なら理由を返す
+      if (account.is_banned) {
+        const banReason =
+          typeof account.ban_reason === "string" &&
+          account.ban_reason.trim().length > 0
+            ? account.ban_reason.trim()
+            : "理由は登録されていません。";
 
-  return json({
-    error: `このアカウントはBANされています。理由：${banReason}`,
-    code: "ACCOUNT_BANNED",
-    ban_reason: banReason,
-  }, 403);
-}
+        return json({
+          error: `このアカウントはBANされています。\n理由：${banReason}`,
+          code: "ACCOUNT_BANNED",
+          ban_reason: banReason,
+        }, 403);
+      }
 
       const { error: updateError } = await supabase
         .from("stax_accounts")
-        .update({ last_login_at: new Date().toISOString() })
+        .update({
+          last_login_at: new Date().toISOString(),
+        })
         .eq("id", account.id);
 
       if (updateError) throw updateError;
 
       const session = await createSession(supabase, account.id);
 
-      const { password_hash: _secret, is_banned: _banned, ...safeUser } =
-        account;
+      const {
+        password_hash: _secret,
+        is_banned: _banned,
+        ban_reason: _banReason,
+        ...safeUser
+      } = account;
 
       return json({
         user: safeUser,
