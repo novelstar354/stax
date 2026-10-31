@@ -55,6 +55,16 @@ button:focus-visible,input:focus-visible,textarea:focus-visible {
 .sidebar-account-info { min-width:0;flex:1;line-height:1.45; }
 .sidebar-account-name { display:block;font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
 .sidebar-account-id { display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+.sidebar-account-wrap{position:relative;margin-top:auto;padding-top:14px;border-top:1px solid var(--line)}
+.sidebar-account{margin-top:0;padding:4px 6px;cursor:default}
+.account-more{border:0;background:transparent;color:var(--muted);font-size:23px;line-height:1;padding:8px;border-radius:9px;flex:0 0 auto}
+.account-more:hover{background:#18263a;color:var(--text)}
+.account-popover{position:absolute;left:0;right:0;bottom:calc(100% + 8px);z-index:50;padding:6px;background:#111c2b;border:1px solid var(--line);border-radius:13px;box-shadow:0 12px 32px #0009}
+.account-popover[hidden]{display:none!important}
+.account-popover button{display:block;width:100%;text-align:left;padding:11px 12px;border:0;border-radius:9px;background:transparent;color:var(--text)}
+.account-popover button:hover{background:#20314a}
+.nav-compose{margin:18px 0 10px;padding:14px 16px;text-align:center;background:var(--blue);color:#fff;font-weight:800;border-radius:999px}
+.nav-compose:hover{background:#2873e8}
 .main { min-width:0 }
 .top {
   padding:18px 20px;
@@ -234,13 +244,19 @@ textarea { min-height:100px;resize:vertical }
     <button class="nav" data-page="profile">◉ プロフィール</button>
     <button class="nav" data-page="settings">⚙ 設定</button>
     <button class="nav hidden" data-page="reports" id="adminReportsNav">⚑ 通報管理</button>
-    <button class="nav" id="accountSwitch">⇄ アカウント切替</button>
-    <button class="nav" id="logout">↪ ログアウト</button>
-    <div class="sidebar-account" id="sidebarAccount" aria-label="ログイン中のアカウント">
-      <div class="sidebar-account-avatar" id="sidebarAccountAvatar">S</div>
-      <div class="sidebar-account-info">
-        <span class="sidebar-account-name" id="sidebarAccountName">ログイン中</span>
-        <span class="sidebar-account-id" id="sidebarAccountId">@-</span>
+    <button class="nav nav-compose" id="navCompose">＋ ポストする</button>
+    <div class="sidebar-account-wrap" id="sidebarAccountWrap">
+      <div class="account-popover" id="accountPopover" hidden>
+        <button type="button" id="accountSwitch">⇄ アカウント</button>
+        <button type="button" id="logout">↪ ログアウト</button>
+      </div>
+      <div class="sidebar-account" id="sidebarAccount" aria-label="ログイン中のアカウント">
+        <div class="sidebar-account-avatar" id="sidebarAccountAvatar">S</div>
+        <div class="sidebar-account-info">
+          <span class="sidebar-account-name" id="sidebarAccountName">ログイン中</span>
+          <span class="sidebar-account-id" id="sidebarAccountId">@-</span>
+        </div>
+        <button type="button" class="account-more" id="accountMore" aria-label="アカウントメニュー" aria-expanded="false">⋯</button>
       </div>
     </div>
   </aside>
@@ -543,7 +559,38 @@ textarea { min-height:100px;resize:vertical }
     sessionStorage.setItem("stax_saved_accounts", JSON.stringify(list.slice(0, 10)));
   }
 
+  function closeAccountPopover() {
+    $("accountPopover").hidden = true;
+    $("accountMore").setAttribute("aria-expanded", "false");
+  }
+  $("accountMore").addEventListener("click", event => {
+    event.stopPropagation();
+    const opening = $("accountPopover").hidden;
+    $("accountPopover").hidden = !opening;
+    $("accountMore").setAttribute("aria-expanded", String(opening));
+  });
+  document.addEventListener("click", event => {
+    if (!$("sidebarAccountWrap").contains(event.target)) closeAccountPopover();
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape") closeAccountPopover();
+  });
+  $("navCompose").addEventListener("click", () => {
+    closeAccountPopover();
+    page = "home";
+    document.querySelectorAll("[data-page]").forEach(item =>
+      item.classList.toggle("active", item.dataset.page === "home")
+    );
+    closeMobileMenu();
+    loadPage();
+    setTimeout(() => {
+      $("composer").scrollIntoView({behavior:"smooth", block:"start"});
+      $("postText").focus({preventScroll:true});
+    }, 80);
+  });
+
   $("accountSwitch").addEventListener("click", async () => {
+    closeAccountPopover();
     closeMobileMenu();
     try {
       if (currentUser && sessionStorage.getItem("stax_token")) rememberAccount(currentUser, sessionStorage.getItem("stax_token"));
@@ -1291,6 +1338,7 @@ textarea { min-height:100px;resize:vertical }
   });
 
   $("logout").addEventListener("click", () => {
+    closeAccountPopover();
     closeMobileMenu();
     if (currentUser && sessionStorage.getItem("stax_token")) rememberAccount(currentUser, sessionStorage.getItem("stax_token"));
     sessionStorage.removeItem("stax_token");
