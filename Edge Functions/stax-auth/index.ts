@@ -165,7 +165,9 @@ Deno.serve(async (request: Request) => {
           display_name: displayName.trim(),
           password_hash: passwordHash,
         })
-        .select("id,user_id,display_name,avatar_url,bio,is_private")
+        .select(
+  "id,user_id,display_name,password_hash,avatar_url,bio,is_private,is_banned,ban_reason",
+)
         .single();
 
       if (insertError) {
@@ -203,12 +205,24 @@ Deno.serve(async (request: Request) => {
       if (error) throw error;
 
       if (
-        !account ||
-        account.is_banned ||
-        !(await bcrypt.compare(password, account.password_hash))
-      ) {
-        return json({ error: "IDまたはパスワードが正しくありません。" }, 401);
-      }
+  !account ||
+  !(await bcrypt.compare(password, account.password_hash))
+) {
+  return json({ error: "IDまたはパスワードが正しくありません。" }, 401);
+}
+
+if (account.is_banned) {
+  const banReason =
+    typeof account.ban_reason === "string" && account.ban_reason.trim()
+      ? account.ban_reason.trim()
+      : "理由は登録されていません。";
+
+  return json({
+    error: `このアカウントはBANされています。理由：${banReason}`,
+    code: "ACCOUNT_BANNED",
+    ban_reason: banReason,
+  }, 403);
+}
 
       const { error: updateError } = await supabase
         .from("stax_accounts")
