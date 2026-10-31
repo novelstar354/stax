@@ -84,6 +84,9 @@ textarea { min-height:100px;resize:vertical }
 }
 .muted { color:var(--muted);font-size:13px }
 .post-text { white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65 }
+.post-text.is-collapsed { max-height:13.2em;overflow:hidden; }
+.post-expand-button { display:inline-block;margin-top:7px;padding:4px 0;border:0;background:transparent;color:#68a5ff;font:inherit;font-size:13px;font-weight:700;cursor:pointer; }
+.post-expand-button:hover { color:#9bc4ff;text-decoration:underline; }
 .hashtag-link { display:inline;padding:0;border:0;background:transparent;color:#68a5ff;font:inherit;font-weight:650;cursor:pointer; }
 .hashtag-link:hover { text-decoration:underline;color:#9bc4ff }
 .hashtag-hint { margin-top:7px;color:var(--muted);font-size:12px }
@@ -779,7 +782,26 @@ textarea { min-height:100px;resize:vertical }
       '<button class="action" data-action="repost">' + (post.reposted_by_me ? 'リポスト済み' : 'リポスト') + ' <span class="post-count">' + Number(post.repost_count || 0) + '</span></button>' +
       '<button class="action" data-action="like">' + (post.liked_by_me ? '♥' : '♡') + ' いいね <span class="post-count">' + Number(post.like_count || 0) + '</span></button></div>' +
       '<div class="reply-area" hidden></div>';
-    renderHashtagText(article.querySelector('.post-text'), post.text || post.content || "");
+    const postText = article.querySelector('.post-text');
+    const postBody = String(post.text || post.content || "");
+    renderHashtagText(postText, postBody);
+
+    // 長文は約8行で折りたたみ、ボタンで全文を展開する。
+    const shouldCollapse = postBody.length > 240 || postBody.split("\n").length > 8;
+    let expandButton = null;
+    if (shouldCollapse) {
+      postText.classList.add("is-collapsed");
+      expandButton = document.createElement("button");
+      expandButton.type = "button";
+      expandButton.className = "post-expand-button";
+      expandButton.textContent = "全部を表示";
+      expandButton.setAttribute("aria-expanded", "false");
+      expandButton.addEventListener("click", () => {
+        const collapsed = postText.classList.toggle("is-collapsed");
+        expandButton.textContent = collapsed ? "全部を表示" : "折りたたむ";
+        expandButton.setAttribute("aria-expanded", String(!collapsed));
+      });
+    }
     if (Array.isArray(post.media) && post.media.length) {
       const mediaBox = document.createElement("div"); mediaBox.className = "post-media";
       post.media.forEach(media => {
@@ -787,7 +809,11 @@ textarea { min-height:100px;resize:vertical }
         const img = document.createElement("img"); img.src = media.media_url; img.alt = "投稿画像"; img.loading = "lazy";
         mediaBox.append(img);
       });
-      if (mediaBox.childElementCount) article.querySelector(".post-text").after(mediaBox);
+      if (mediaBox.childElementCount) postText.after(mediaBox);
+    }
+    if (expandButton) {
+      const media = postText.nextElementSibling?.classList.contains("post-media") ? postText.nextElementSibling : null;
+      (media || postText).after(expandButton);
     }
     article.querySelector('[data-author-profile]').addEventListener('click', () => {
       if (!post.user_id) return;
