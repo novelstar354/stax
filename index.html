@@ -230,6 +230,7 @@ textarea { min-height:100px;resize:vertical }
     <button class="nav" data-page="messages">✉ DM</button>
     <button class="nav" data-page="profile">◉ プロフィール</button>
     <button class="nav" data-page="settings">⚙ 設定</button>
+    <button class="nav hidden" data-page="reports" id="adminReportsNav">⚑ 通報管理</button>
     <button class="nav" id="accountSwitch">⇄ アカウント切替</button>
     <button class="nav" id="logout">↪ ログアウト</button>
     <div class="sidebar-account" id="sidebarAccount" aria-label="ログイン中のアカウント">
@@ -438,6 +439,7 @@ textarea { min-height:100px;resize:vertical }
     $("auth").classList.add("hidden");
     $("app").classList.remove("hidden");
     updateSidebarAccount(user);
+    $("adminReportsNav").classList.toggle("hidden", user.is_admin !== true);
     loadPage();
   }
 
@@ -667,7 +669,7 @@ textarea { min-height:100px;resize:vertical }
 
   async function loadPage() {
     $("pageTitle").textContent = ({
-      home:"ホーム",search:"検索", notifications:"通知",messages:"DM",profile:"プロフィール",settings:"設定"
+      home:"ホーム",search:"検索", notifications:"通知",messages:"DM",profile:"プロフィール",settings:"設定",reports:"通報管理"
     })[page] || "Stax";
     const mobileTitle = $("mobileCurrentPage");
     if (mobileTitle) mobileTitle.textContent = $("pageTitle").textContent;
@@ -678,6 +680,7 @@ textarea { min-height:100px;resize:vertical }
       let result;
       if (page === "profile") result = await api("profile", viewedProfileId ? {user_id:viewedProfileId} : {});
       else if (page === "settings") result = await api("profile", {});
+      else if (page === "reports") result = await api("admin_reports");
       else result = await api(page === "home" ? "timeline" : page,
         page === "search" ? {query:$("searchInput").value.trim()} : {});
       renderResult(result);
@@ -1158,10 +1161,55 @@ textarea { min-height:100px;resize:vertical }
     });
   }
 
+  function renderAdminReports(result) {
+    const root = $("content"); root.replaceChildren();
+    const reports = Array.isArray(result.reports) ? result.reports : [];
+    const heading = document.createElement("div"); heading.className = "panel";
+    heading.innerHTML = '<div class="row between"><strong>報告されたポスト</strong><button class="btn secondary" id="refreshReports">更新</button></div><p class="muted" style="margin:8px 0 0">通報内容と投稿者を確認し、必要に応じて対象ポストを削除できます。</p>';
+    root.appendChild(heading);
+    heading.querySelector("#refreshReports").addEventListener("click", loadPage);
+    if (!reports.length) {
+      const empty = document.createElement("div"); empty.className = "panel muted"; empty.textContent = "報告されたポストはありません。"; root.appendChild(empty); return;
+    }
+    reports.forEach(report => {
+      const card = document.createElement("article"); card.className = "post";
+      const reporter = (report.reporter_display_name || report.reporter_user_id || "不明") + (report.reporter_user_id ? " (@" + report.reporter_user_id + ")" : "");
+      const author = (report.post_author_display_name || report.reported_display_name || report.post_author_user_id || report.reported_user_id || "不明") + ((report.post_author_user_id || report.reported_user_id) ? " (@" + (report.post_author_user_id || report.reported_user_id) + ")" : "");
+      const postMissing = !report.reported_post_id || report.post_is_deleted === true;
+      const top = document.createElement("div"); top.className = "row between";
+      const date = document.createElement("span"); date.className = "muted"; date.textContent = report.report_created_at ? new Date(report.report_created_at).toLocaleString() : (report.created_at ? new Date(report.created_at).toLocaleString() : "日時不明");
+      const statusLabel = document.createElement("span"); statusLabel.className = "muted"; statusLabel.textContent = postMissing ? "投稿は削除済み" : (report.status || "未対応");
+      top.append(date, statusLabel); card.appendChild(top);
+      const info = document.createElement("div"); info.style.cssText = "margin-top:10px;line-height:1.7";
+      const reporterLine = document.createElement("div"); reporterLine.textContent = "報告者: " + reporter;
+      const authorLine = document.createElement("div"); authorLine.textContent = "投稿アカウント: " + author;
+      const idLine = document.createElement("div"); idLine.className = "muted"; idLine.textContent = "ポストID: " + (report.reported_post_id || "なし");
+      const reasonLine = document.createElement("div"); reasonLine.textContent = "報告理由: " + (report.reason || "未入力");
+      const details = document.createElement("div"); details.className = "muted"; details.style.whiteSpace = "pre-wrap"; details.textContent = report.details || "";
+      info.append(reporterLine, authorLine, idLine, reasonLine); if (report.details) info.appendChild(details); card.appendChild(info);
+      const body = document.createElement("div"); body.className = "post-text"; body.style.cssText = "margin-top:12px;padding:12px;background:#0b111a;border:1px solid var(--line);border-radius:12px";
+      body.textContent = report.post_content || (postMissing ? "このポストは削除済み、または見つかりません。" : "ポスト本文を取得できません。"); card.appendChild(body);
+      const actions = document.createElement("div"); actions.className = "actions";
+      if (!postMissing) {
+        const del = document.createElement("button"); del.className = "btn"; del.textContent = "このポストを削除";
+        del.addEventListener("click", async () => {
+          const confirmed = await openUiModal({title:"報告されたポストを削除",message:"このポストを削除しますか？タイムラインなどから表示されなくなります。",confirmText:"ポストを削除",danger:true});
+          if (!confirmed) return;
+          del.disabled = true;
+          try { await api("admin_delete_reported_post", {post_id:report.reported_post_id}); await loadPage(); }
+          catch (error) { status(error.message || "削除できませんでした。", "content"); del.disabled = false; }
+        });
+        actions.appendChild(del);
+      }
+      card.appendChild(actions); root.appendChild(card);
+    });
+  }
+
   function renderResult(result) {
     if (page === "messages") { renderMessages(result); return; }
     if (page === "profile") { renderProfile(result); return; }
     if (page === "settings") { renderSettings(result); return; }
+    if (page === "reports") { renderAdminReports(result); return; }
     const root = $("content"); root.replaceChildren();
     if (page === "search") {
       const accounts = result.accounts || [];
