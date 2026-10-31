@@ -362,6 +362,36 @@ Deno.serve(async (request: Request) => {
       return json({ accounts, kind });
     }
 
+    // Edit own comment (reply only)
+    if (action === "edit_reply") {
+      const replyId = body.reply_id;
+      const content = requiredText(body.text, 2000);
+      if (typeof replyId !== "string" || !content) {
+        return json({ error: "reply_idと本文（1〜2000文字）が必要です。" }, 400);
+      }
+      const { data: reply, error: replyError } = await supabase
+        .from("stax_posts")
+        .select("id,author_id,reply_to_id,is_deleted")
+        .eq("id", replyId)
+        .maybeSingle();
+      if (replyError) throw replyError;
+      if (!reply || reply.is_deleted || !reply.reply_to_id) {
+        return json({ error: "コメントが見つかりません。" }, 404);
+      }
+      if (reply.author_id !== myId) {
+        return json({ error: "自分のコメントだけ編集できます。" }, 403);
+      }
+      const { data: updated, error: updateError } = await supabase
+        .from("stax_posts")
+        .update({ content, updated_at: new Date().toISOString() })
+        .eq("id", replyId)
+        .eq("author_id", myId)
+        .select("id,content,updated_at")
+        .single();
+      if (updateError) throw updateError;
+      return json({ success: true, reply: updated });
+    }
+
     // Delete own post or reply (soft-delete)
     if (action === "delete_post") {
       const postId = body.post_id;
@@ -1559,11 +1589,51 @@ Deno.serve(async (request: Request) => {
       const { data, error } = await supabase
         .from("stax_report_details")
         .select("*")
-        .order("created_at", { ascending: false })
+        .order("report_created_at", { ascending: false })
         .limit(100);
 
       if (error) throw error;
       return json({ reports: data || [] });
+    }
+
+    // Admin soft-delete a post only when it has at least one report.
+    if (action === "admin_delete_reported_post") {
+      if (me.is_admin !== true) {
+        return json({ error: "管理者権限が必要です。" }, 403);
+      }
+
+      const postId = typeof body.post_id === "string" ? body.post_id : "";
+      if (!postId) return json({ error: "post_idが必要です。" }, 400);
+
+      // Verify that this exact post is present in the reports table.
+      const { data: report, error: reportError } = await supabase
+        .from("stax_reports")
+        .select("id")
+        .eq("reported_post_id", postId)
+        .limit(1)
+        .maybeSingle();
+      if (reportError) throw reportError;
+      if (!report) {
+        return json({ error: "このポストに対する通報が見つかりません。" }, 404);
+      }
+
+      const { data: post, error: postError } = await supabase
+        .from("stax_posts")
+        .select("id,is_deleted")
+        .eq("id", postId)
+        .maybeSingle();
+      if (postError) throw postError;
+      if (!post) return json({ error: "ポストが見つかりません。" }, 404);
+
+      if (post.is_deleted !== true) {
+        const { error: deleteError } = await supabase
+          .from("stax_posts")
+          .update({ is_deleted: true, updated_at: new Date().toISOString() })
+          .eq("id", postId);
+        if (deleteError) throw deleteError;
+      }
+
+      return json({ success: true, deleted: true, post_id: postId });
     }
 
     // Admin account ban / unban
